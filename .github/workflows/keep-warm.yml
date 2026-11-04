@@ -1,0 +1,40 @@
+name: Check production services
+
+# The Django backend is always on at the Nhân Hòa VPS. This scheduled check still
+# exercises Django plus the Supabase connection and keeps the Hugging Face Space
+# responsive during Vietnam's active hours.
+#
+# This repository is public, so scheduled GitHub Actions minutes are free.
+
+on:
+  schedule:
+    # Every 10 minutes during UTC 22:00-16:59 (= 05:00-23:59 Asia/Ho_Chi_Minh).
+    - cron: "*/10 0-16,22,23 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Check Django VPS and Supabase
+        run: |
+          curl --silent --show-error --fail \
+               --max-time 90 \
+               --retry 3 --retry-delay 20 --retry-all-errors \
+               --write-out 'vps: HTTP %{http_code} in %{time_total}s\n' \
+               --output /dev/null \
+               https://api.agromind.farm/api/health/
+
+      - name: Wake inference Space (Hugging Face)
+        run: |
+          curl --silent --show-error --fail \
+               --max-time 90 \
+               --retry 3 --retry-delay 20 --retry-all-errors \
+               --write-out 'hf: HTTP %{http_code} in %{time_total}s\n' \
+               --output /dev/null \
+               https://phamducmanh-agromind-cnn-api.hf.space/health

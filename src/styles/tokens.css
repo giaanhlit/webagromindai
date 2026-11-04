@@ -1,0 +1,87 @@
+/**
+ * Agromind AI design tokens: single source for all colors, radii, motion.
+ *
+ * Palette is the DIEPTEK brand sheet (2026-09-10). Light theme only: the sheet
+ * defines no dark set and the toggle was removed, so there is one block.
+ * Every alpha, shadow and scrim is derived from the ink #14291A, never from
+ * black. The one colour outside the sheet is --sun, kept because the
+ * dashboard's "needs follow-up" state has no equivalent in it.
+ */
+:root {
+  /* Surfaces */
+  --canvas: #F7F9F4;
+  --surface: #FFFFFF;
+  --surface-raised: #FFFFFF;
+  --surface-soft: #E8F3E4;
+  --surface-overlay: #E8F3E4;
+  --paper: var(--surface-raised);
+  --qr-paper: #FFFFFF;
+
+  /* Ink */
+  --ink: #14291A;
+  --ink-strong: #14291A;
+  --ink-soft: #5B6B5E;
+  --ink-muted: #5B6B5E;
+  /* 3.1:1 on white — wordmarks >= 18px bold and the copyright line only. */
+  --grey: #8A968C;
+  --line: rgba(20, 41, 26, 0.12);
+  --line-strong: rgba(20, 41, 26, 0.16);
+
+  /* Greens */
+  --forest: #14291A;
+  --on-forest: #FFFFFF;
+  --on-forest-muted: #B9C7BC;
+  --leaf: #2F7D32;
+  --leaf-strong: #1B5E20;
+  --on-leaf: #FFFFFF;
+  --mint: #E8F3E4;
+  /* Lime is spice: eyebrow dash, nav underline, buttons on dark, step dots.
+     Never as text on white, never white text on it. */
+  --accent: #6DBE45;
+  --accent-hover: #7FCB58;
+  --on-accent: #14291A;
+  /* Only the 6px "live" dot and the tail of a progress bar. */
+  --signal: #22D3EE;
+
+  /* Semantic */
+  --sun: #EAB64B;
+  --sun-soft: rgba(234, 182, 75, 0.16);
+  --warning-ink: #654A05;
+  --soil: #5B6B5E;
+  --danger: #9B2C2C;
+  --danger-soft: #FDECEC;
+  --danger-ink: #9B2C2C;
+  --on-danger: #FFFFFF;
+  --info: #2F7D32;
+  --info-soft: #E8F3E4;
+  --info-ink: #1B5E20;
+  --success-soft: #E8F3E4;
+  --success-ink: #1B5E20;
+
+  /* ── Radii: 8 buttons/inputs, 12 notices, 16 cards, pill chips ── */
+  --r-sm:   8px;
+  --r-md:   8px;
+  --r-lg:   12px;
+  --r-xl:   16px;
+  --r-2xl:  16px;
+  --r-pill: 9999px;
+
+  /* ── Elevation ── */
+  --shadow-sm:     0 2px 8px rgba(20, 41, 26, 0.12);
+  --shadow-md:     0 8px 24px rgba(20, 41, 26, 0.08);
+  --shadow-lg:     0 18px 40px rgba(20, 41, 26, 0.16);
+  --shadow-button: 0 12px 26px rgba(20, 41, 26, 0.24);
+  --shadow-focus:  0 0 0 3px rgba(47, 125, 50, 0.15);
+  --shadow-glow:   var(--shadow-focus);
+
+  /* ── Motion ── */
+  --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --d-fast: 120ms;
+  --d-base: 180ms;
+  --d-slow: 260ms;
+
+  --ring-leaf: rgba(47, 125, 50, 0.35);
+
+  color-scheme: light;
+}

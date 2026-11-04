@@ -1,0 +1,88 @@
+"use client";
+
+import Link from "next/link";
+import { Crown, LogOut, Menu, ScanSearch } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { toast } from "sonner";
+
+import { LanguageToggle } from "@/components/layout/language-toggle";
+import { Badge } from "@/components/ui/badge";
+import { buttonVariants } from "@/components/ui/button";
+import { normalizePlan, PLANS } from "@/lib/plans";
+import { useTr } from "@/lib/use-tr";
+import { normalizeUserDisplayName } from "@/lib/user-profile";
+import { useSessionStore } from "@/store/session-store";
+import type { PlanTier } from "@/types";
+
+interface WorkspaceHeaderProps {
+  pageTitle: string;
+  pageDescription?: string;
+  mobileNavOpen?: boolean;
+  onOpenMobileNav?: () => void;
+}
+
+function planBadgeVariant(plan: PlanTier) {
+  if (plan === "elite") return "elite" as const;
+  if (plan === "bloom") return "success" as const;
+  return "muted" as const;
+}
+
+export function WorkspaceHeader({ pageTitle, pageDescription, mobileNavOpen = false, onOpenMobileNav }: WorkspaceHeaderProps) {
+  const router = useRouter();
+  const { user, logout } = useSessionStore();
+  const tr = useTr();
+  const [scrolled, setScrolled] = useState(false);
+
+  useEffect(() => {
+    const sync = () => setScrolled(window.scrollY > 4);
+    sync();
+    window.addEventListener("scroll", sync, { passive: true });
+    return () => window.removeEventListener("scroll", sync);
+  }, []);
+  const plan = normalizePlan(user?.currentPlan);
+  const planInfo = PLANS[plan];
+  const displayName = normalizeUserDisplayName(user?.name);
+  const initials = displayName[0]?.toUpperCase() ?? "U";
+
+  return (
+    <header className={`workspace-header sticky top-0 z-30 flex min-h-[72px] shrink-0 items-center px-4 transition-shadow duration-260 sm:px-6 lg:px-8 ${scrolled ? "shadow-md" : ""}`}>
+      <div className="flex w-full min-w-0 items-center gap-3">
+        {onOpenMobileNav ? (
+          <button id="workspace-mobile-nav-trigger" type="button" onClick={onOpenMobileNav} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-line bg-surface text-ink-soft transition hover:bg-surface-soft hover:text-ink lg:hidden" aria-label={tr("Mở menu điều hướng", "Open navigation")} aria-expanded={mobileNavOpen} aria-controls="workspace-sidebar">
+            <Menu size={19} aria-hidden />
+          </button>
+        ) : null}
+
+        <div className="min-w-0 flex-1">
+          <h1 className="truncate font-display text-base font-bold tracking-[-0.02em] text-ink sm:text-lg">{pageTitle}</h1>
+          {pageDescription ? <p className="mt-0.5 hidden truncate text-xs text-ink-soft md:block">{pageDescription}</p> : null}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-2">
+          <Badge variant={planBadgeVariant(plan)} className="hidden min-h-8 items-center gap-1.5 px-3 sm:inline-flex">
+            <Crown size={13} aria-hidden /> {planInfo.name}
+          </Badge>
+          <LanguageToggle />
+          <Link href="/dashboard/diagnosis" className={buttonVariants({ variant: "primary", size: "sm", className: "hidden md:inline-flex" })}>
+            <ScanSearch size={16} aria-hidden /> {tr("Kiểm tra ảnh mới", "New leaf check")}
+          </Link>
+          <Link href="/dashboard/profile" className="flex h-11 min-w-11 items-center gap-2 rounded-xl border border-line bg-surface px-1.5 pr-2.5 transition hover:bg-surface-soft" aria-label={tr("Mở hồ sơ người dùng", "Open profile")}>
+            <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-surface-soft text-xs font-bold text-leaf-strong">{initials}</span>
+            <span className="hidden max-w-[140px] truncate text-xs font-semibold text-ink xl:block">{displayName}</span>
+          </Link>
+          <button type="button" onClick={async () => {
+            try {
+              await logout();
+              router.push("/login");
+            } catch {
+              toast.error(tr("Chưa thể đăng xuất. Kiểm tra kết nối rồi thử lại.", "Could not sign out. Check your connection and try again."));
+            }
+          }} className="flex h-11 w-11 items-center justify-center rounded-xl text-ink-soft transition hover:bg-danger-soft hover:text-danger-ink" aria-label={tr("Đăng xuất", "Log out")}>
+            <LogOut size={17} aria-hidden />
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+}

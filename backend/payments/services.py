@@ -1,0 +1,624 @@
+import re
+import secrets
+import string
+from decimal import Decimal, InvalidOperation
+from urllib.parse import urlencode
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.db import transaction
+from django.utils import timezone
+
+from engagement.models import ServicePlan, UserSubscription
+
+from .entitlements import PLAN_ORDER
+from .models import Payment, PaymentOrder
+
+User = get_user_model()
+
+OPEN_ORDER_STATUSES = (PaymentOrder.Status.PENDING, PaymentOrder.Status.UNDERPAID)
+# Money has arrived but the plan is not on: these orders wait for a human.
+RECONCILIATION_STATUSES = (PaymentOrder.Status.OVERPAID, PaymentOrder.Status.REVIEW)
+
+
+class PaymentConfigurationError(RuntimeError):
+    pass
+
+
+class PaymentRequestError(ValueError):
+    pass
+
+
+def normalize_account_number(value):
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def ping_reason(payload):
+    """Why a signed payload carries nothing to act on, or "" if it does.
+
+    SePay's test-send button posts a correctly signed payload with no real
+    transaction in it. Acknowledging that is right; quietly acknowledging a real
+    transfer we failed to parse would lose someone's money, so the two are kept
+    apart deliberately narrowly: a payload counts as a ping only when it names no
+    order at all. Anything that references an order stays a 400 so a genuine
+    parsing problem cannot hide behind a green tick.
+    """
+    from developer_api.topups import extract_topup_code
+
+    if _extract_payment_code(payload) or extract_topup_code(payload):
+        return ""
+    if not str(payload.get("id") or "").strip():
+        return "no_transaction_id"
+    try:
+        _parse_amount(payload.get("transferAmount"))
+    except PaymentRequestError:
+        return "no_transfer_amount"
+    return ""
+
+
+def payer_account_number():
+    """The number to put in front of the payer.
+
+    Some banks — BIDV among them — only report a transfer to SePay when it
+    arrives through a virtual account, so quoting the master account produces a
+    transfer that reaches the bank and is never seen by the gateway. When a
+    virtual account is configured it is what the payer must use.
+    """
+    virtual = normalize_account_number(getattr(settings, "SEPAY_VIRTUAL_ACCOUNT", ""))
+    return virtual or normalize_account_number(getattr(settings, "SEPAY_ACCOUNT_NUMBER", ""))
+
+
+def ensure_payment_configuration():
+    required = {
+        "SEPAY_BANK_CODE": getattr(settings, "SEPAY_BANK_CODE", ""),
+        "SEPAY_ACCOUNT_NUMBER": getattr(settings, "SEPAY_ACCOUNT_NUMBER", ""),
+        "SEPAY_ACCOUNT_NAME": getattr(settings, "SEPAY_ACCOUNT_NAME", ""),
+    }
+    missing = [key for key, value in required.items() if not str(value).strip()]
+    if missing:
+        raise PaymentConfigurationError(
+            "Dich vu thanh toan chua duoc cau hinh day du: " + ", ".join(missing)
+        )
+
+
+def expire_user_plan(user, now=None):
+    now = now or timezone.now()
+    if user.current_plan == "seed" or not user.plan_expires_at or user.plan_expires_at > now:
+        return False
+
+    UserSubscription.objects.filter(
+        user=user,
+        status__in=("active", "trial"),
+    ).update(status="expired", ends_at=now, updated_at=now)
+    user.current_plan = "seed"
+    user.plan_expires_at = None
+    user.save(update_fields=["current_plan", "plan_expires_at", "updated_at"])
+    return True
+
+
+def get_purchasable_plan(slug):
+    normalized = str(slug or "").strip().lower()
+    if normalized not in PLAN_ORDER or normalized == "seed":
+        raise PaymentRequestError("Gói dịch vụ không hợp lệ.")
+
+    plan = ServicePlan.objects.filter(slug=normalized, is_active=True).first()
+    if not plan:
+        raise PaymentRequestError("Gói dịch vụ hiện không mở bán.")
+
+    try:
+        amount = Decimal(plan.price_monthly)
+    except (InvalidOperation, TypeError):
+        raise PaymentConfigurationError("Gia goi dich vu khong hop le.")
+    if amount <= 0 or amount != amount.to_integral_value():
+        raise PaymentConfigurationError("Gia goi dich vu phai la so nguyen VND lon hon 0.")
+    return plan, int(amount)
+
+
+def _generate_payment_code():
+    prefix = re.sub(r"[^A-Z0-9]", "", getattr(settings, "SEPAY_PAYMENT_PREFIX", "AGM").upper())[:8]
+    prefix = prefix or "AGM"
+    alphabet = string.ascii_uppercase + string.digits
+    while True:
+        suffix = "".join(secrets.choice(alphabet) for _ in range(12))
+        code = f"{prefix}{suffix}"
+        if not PaymentOrder.objects.filter(payment_code=code).exists():
+            return code
+
+
+@transaction.atomic
+def create_payment_order(user, plan_slug):
+    ensure_payment_configuration()
+    now = timezone.now()
+    locked_user = User.objects.select_for_update().get(pk=user.pk)
+    expire_user_plan(locked_user, now=now)
+
+    plan, amount = get_purchasable_plan(plan_slug)
+    current_plan = locked_user.current_plan if locked_user.current_plan in PLAN_ORDER else "seed"
+    if PLAN_ORDER.index(plan.slug) < PLAN_ORDER.index(current_plan):
+        until = (
+            f" đến {timezone.localtime(locked_user.plan_expires_at):%d/%m/%Y}"
+            if locked_user.plan_expires_at
+            else ""
+        )
+        raise PaymentRequestError(
+            f"Gói {current_plan.title()} vẫn còn hiệu lực{until} nên chưa thể mua gói thấp hơn. "
+            "Khi gói hiện tại hết hạn, tài khoản sẽ tự chuyển về gói Seed miễn phí và bạn có thể chọn gói khác."
+        )
+
+    # An order that already received money but never activated must be handed
+    # back instead of minting a second code — otherwise the grower pays twice
+    # for the same plan while the first transfer waits for reconciliation.
+    awaiting_reconciliation = (
+        PaymentOrder.objects.select_for_update()
+        .filter(user=locked_user, plan=plan, status__in=RECONCILIATION_STATUSES)
+        .order_by("-created_at")
+        .first()
+    )
+    if awaiting_reconciliation:
+        return awaiting_reconciliation, False
+
+    PaymentOrder.objects.filter(
+        user=locked_user,
+        status__in=OPEN_ORDER_STATUSES,
+        expires_at__lte=now,
+    ).update(status=PaymentOrder.Status.EXPIRED, updated_at=now)
+
+    existing = (
+        PaymentOrder.objects.select_for_update()
+        .filter(
+            user=locked_user,
+            plan=plan,
+            status__in=OPEN_ORDER_STATUSES,
+            expires_at__gt=now,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if existing:
+        return existing, False
+
+    PaymentOrder.objects.filter(
+        user=locked_user,
+        status__in=OPEN_ORDER_STATUSES,
+        expires_at__gt=now,
+    ).exclude(plan=plan).update(status=PaymentOrder.Status.CANCELLED, updated_at=now)
+
+    ttl_minutes = max(5, int(getattr(settings, "SEPAY_ORDER_TTL_MINUTES", 30)))
+    order = PaymentOrder.objects.create(
+        user=locked_user,
+        plan=plan,
+        payment_code=_generate_payment_code(),
+        amount_expected=amount,
+        currency=plan.currency or "VND",
+        expires_at=now + timezone.timedelta(minutes=ttl_minutes),
+        metadata={"plan_before_purchase": current_plan},
+    )
+    return order, True
+
+
+def build_qr_url(order):
+    ensure_payment_configuration()
+    query = urlencode(
+        {
+            "bank": settings.SEPAY_BANK_CODE,
+            "acc": payer_account_number(),
+            "amount": order.amount_expected,
+            "des": order.payment_code,
+            "template": "compact",
+        }
+    )
+    base_url = getattr(settings, "SEPAY_QR_BASE_URL", "https://vietqr.app/img").rstrip("?")
+    return f"{base_url}?{query}"
+
+
+def _extract_payment_code(payload):
+    prefix = re.sub(r"[^A-Z0-9]", "", getattr(settings, "SEPAY_PAYMENT_PREFIX", "AGM").upper())[:8]
+    prefix = prefix or "AGM"
+    direct_code = str(payload.get("code") or "").upper().strip()
+    if direct_code.startswith(prefix):
+        return direct_code
+
+    content = " ".join(
+        str(payload.get(field) or "")
+        for field in ("content", "description")
+    ).upper()
+    match = re.search(rf"\b{re.escape(prefix)}[A-Z0-9]{{8,24}}\b", content)
+    return match.group(0) if match else ""
+
+
+def _parse_amount(value):
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        raise PaymentRequestError("So tien giao dich khong hop le.")
+    if amount <= 0 or amount != amount.to_integral_value():
+        raise PaymentRequestError("So tien giao dich phai la so nguyen VND lon hon 0.")
+    return int(amount)
+
+
+def _activate_locked_order(order, now):
+    locked_user = User.objects.select_for_update().get(pk=order.user_id)
+    old_plan = locked_user.current_plan if locked_user.current_plan in PLAN_ORDER else "seed"
+    subscription_days = max(1, int(getattr(settings, "SEPAY_SUBSCRIPTION_DAYS", 30)))
+
+    active_subscriptions = UserSubscription.objects.select_for_update().filter(
+        user=locked_user,
+        status__in=("active", "trial"),
+    )
+    same_plan_subscription = active_subscriptions.filter(plan=order.plan).first()
+
+    if same_plan_subscription:
+        base_date = same_plan_subscription.ends_at if same_plan_subscription.ends_at and same_plan_subscription.ends_at > now else now
+        ends_at = base_date + timezone.timedelta(days=subscription_days)
+        same_plan_subscription.status = "active"
+        same_plan_subscription.ends_at = ends_at
+        same_plan_subscription.auto_renew = False
+        same_plan_subscription.payment_provider = "sepay"
+        same_plan_subscription.provider_subscription_id = order.payment_code
+        same_plan_subscription.save(
+            update_fields=[
+                "status",
+                "ends_at",
+                "auto_renew",
+                "payment_provider",
+                "provider_subscription_id",
+                "updated_at",
+            ]
+        )
+        active_subscriptions.exclude(pk=same_plan_subscription.pk).update(
+            status="cancelled",
+            ends_at=now,
+            updated_at=now,
+        )
+    else:
+        active_subscriptions.update(status="cancelled", ends_at=now, updated_at=now)
+        ends_at = now + timezone.timedelta(days=subscription_days)
+        UserSubscription.objects.create(
+            user=locked_user,
+            plan=order.plan,
+            status="active",
+            starts_at=now,
+            ends_at=ends_at,
+            auto_renew=False,
+            payment_provider="sepay",
+            provider_subscription_id=order.payment_code,
+        )
+
+    locked_user.current_plan = order.plan.slug
+    locked_user.plan_expires_at = ends_at
+    locked_user.save(update_fields=["current_plan", "plan_expires_at", "updated_at"])
+
+    order.status = PaymentOrder.Status.PAID
+    order.paid_at = now
+    order.save(
+        update_fields=["status", "paid_at", "amount_received", "updated_at"]
+    )
+    return old_plan, ends_at
+
+
+def order_needs_reconciliation(order):
+    """True when money arrived on an order that never activated a plan.
+
+    Covers the overpaid/late cases and the quieter one: a partial transfer on an
+    order that then expired, which leaves real money with no plan behind it.
+    """
+    if order.status == PaymentOrder.Status.PAID:
+        return False
+    if order.status in RECONCILIATION_STATUSES:
+        return True
+    return order.amount_received > 0
+
+
+@transaction.atomic
+def request_order_reconciliation(order, note=""):
+    """Record that the user asked a human to look at a stuck order."""
+    locked_order = PaymentOrder.objects.select_for_update().get(pk=order.pk)
+    if not order_needs_reconciliation(locked_order):
+        raise PaymentRequestError("Đơn thanh toán này không cần đối soát.")
+
+    metadata = dict(locked_order.metadata or {})
+    reconciliation = dict(metadata.get("reconciliation") or {})
+    reconciliation["requested_at"] = timezone.now().isoformat()
+    reconciliation["amount_received"] = locked_order.amount_received
+    if note:
+        reconciliation["user_note"] = note[:500]
+    metadata["reconciliation"] = reconciliation
+    locked_order.metadata = metadata
+    locked_order.save(update_fields=["metadata", "updated_at"])
+    return locked_order
+
+
+@transaction.atomic
+def reconcile_order(order, actor=None, note=""):
+    """Activate an order whose transfer arrived but whose plan never turned on.
+
+    This is the manual way out of overpaid/review/expired-with-money: the money
+    is already in the account, so the only thing missing is the activation the
+    webhook declined to do automatically.
+    """
+    locked_order = (
+        PaymentOrder.objects.select_for_update()
+        .select_related("plan", "user")
+        .get(pk=order.pk)
+    )
+    if locked_order.status == PaymentOrder.Status.PAID:
+        raise PaymentRequestError("Đơn thanh toán này đã được kích hoạt trước đó.")
+    if locked_order.amount_received <= 0:
+        raise PaymentRequestError("Đơn thanh toán này chưa nhận được tiền nên không thể kích hoạt.")
+
+    now = timezone.now()
+    old_plan, ends_at = _activate_locked_order(locked_order, now)
+
+    metadata = dict(locked_order.metadata or {})
+    reconciliation = dict(metadata.get("reconciliation") or {})
+    reconciliation.update(
+        {
+            "resolved_at": now.isoformat(),
+            "resolved_by": getattr(actor, "email", "") or getattr(actor, "username", "") or "system",
+            "amount_difference": locked_order.amount_received - locked_order.amount_expected,
+            "plan_before": old_plan,
+            "action": "activated",
+        }
+    )
+    if note:
+        reconciliation["admin_note"] = note[:500]
+    metadata["reconciliation"] = reconciliation
+    locked_order.metadata = metadata
+    locked_order.save(update_fields=["metadata", "updated_at"])
+    return locked_order, old_plan, ends_at
+
+
+@transaction.atomic
+def settle_order_from_bank_statement(order, amount, actor=None, note=""):
+    """Record money that reached the bank but never reached us, then activate.
+
+    ``reconcile_order`` refuses an order with ``amount_received == 0``, and that
+    field is only ever written by the webhook. So when the webhook never fires
+    at all — the provider loses the transaction, or its delivery is abandoned —
+    a customer who really paid has no way through, not even an admin one.
+
+    This is that way through, and it is deliberately manual: the operator is
+    asserting they have seen the transfer on the bank statement, because nothing
+    in this system can see it. The amount they state is recorded as the received
+    amount and the payment is written with a ``manual`` provider so it is never
+    mistaken for something the gateway confirmed.
+    """
+    amount = _parse_amount(amount)
+
+    locked_order = (
+        PaymentOrder.objects.select_for_update()
+        .select_related("plan", "user")
+        .get(pk=order.pk)
+    )
+    if locked_order.status == PaymentOrder.Status.PAID:
+        raise PaymentRequestError("Đơn thanh toán này đã được kích hoạt trước đó.")
+    if locked_order.amount_received > 0:
+        raise PaymentRequestError(
+            "Đơn này đã ghi nhận tiền qua cổng thanh toán. Hãy dùng thao tác đối soát thông thường."
+        )
+    if amount < locked_order.amount_expected:
+        raise PaymentRequestError(
+            f"So tien ghi nhan ({amount}) nho hon so tien can tra ({locked_order.amount_expected})."
+        )
+
+    now = timezone.now()
+    actor_label = getattr(actor, "email", "") or getattr(actor, "username", "") or "system"
+
+    _, created = Payment.objects.get_or_create(
+        # Unique per order, so a second attempt collides instead of paying twice.
+        sepay_transaction_id=f"manual-{locked_order.payment_code}",
+        defaults={
+            "order": locked_order,
+            "user": locked_order.user,
+            "amount": amount,
+            "content": locked_order.payment_code,
+            "status": Payment.Status.SUCCESS,
+            # Never "sepay": this was attested by a person reading a statement,
+            # not confirmed by the gateway, and the two must stay tellable apart.
+            "gateway": "manual",
+            "transfer_type": "in",
+            "plan_requested": locked_order.plan.slug,
+            "processed_at": now,
+            "raw_payload": {
+                "source": "bank_statement",
+                "recorded_by": actor_label,
+                "recorded_at": now.isoformat(),
+                "note": note[:500],
+            },
+        },
+    )
+    if not created:
+        raise PaymentRequestError("Đơn này đã được ghi nhận thủ công trước đó.")
+    locked_order.amount_received = amount
+    locked_order.save(update_fields=["amount_received", "updated_at"])
+
+    old_plan, ends_at = _activate_locked_order(locked_order, now)
+
+    metadata = dict(locked_order.metadata or {})
+    reconciliation = dict(metadata.get("reconciliation") or {})
+    reconciliation.update(
+        {
+            "resolved_at": now.isoformat(),
+            "resolved_by": actor_label,
+            "amount_difference": amount - locked_order.amount_expected,
+            "plan_before": old_plan,
+            "action": "activated_from_bank_statement",
+        }
+    )
+    if note:
+        reconciliation["admin_note"] = note[:500]
+    metadata["reconciliation"] = reconciliation
+    locked_order.metadata = metadata
+    locked_order.save(update_fields=["metadata", "updated_at"])
+    return locked_order, old_plan, ends_at
+
+
+@transaction.atomic
+def close_order_as_refunded(order, actor=None, note=""):
+    """Close a stuck order after the money was returned outside the app."""
+    locked_order = PaymentOrder.objects.select_for_update().get(pk=order.pk)
+    if locked_order.status == PaymentOrder.Status.PAID:
+        raise PaymentRequestError("Đơn đã kích hoạt gói, không thể đánh dấu hoàn tiền tại đây.")
+
+    now = timezone.now()
+    metadata = dict(locked_order.metadata or {})
+    reconciliation = dict(metadata.get("reconciliation") or {})
+    reconciliation.update(
+        {
+            "resolved_at": now.isoformat(),
+            "resolved_by": getattr(actor, "email", "") or getattr(actor, "username", "") or "system",
+            "refunded_amount": locked_order.amount_received,
+            "action": "refunded",
+        }
+    )
+    if note:
+        reconciliation["admin_note"] = note[:500]
+    metadata["reconciliation"] = reconciliation
+    locked_order.metadata = metadata
+    locked_order.status = PaymentOrder.Status.CANCELLED
+    locked_order.save(update_fields=["metadata", "status", "updated_at"])
+    return locked_order
+
+
+@transaction.atomic
+def process_sepay_payload(payload):
+    transaction_id = str(payload.get("id") or "").strip()
+    if not transaction_id:
+        raise PaymentRequestError("Thieu ma giao dich SePay.")
+
+    amount = _parse_amount(payload.get("transferAmount"))
+    transfer_type = str(payload.get("transferType") or "").strip().lower()
+    account_number = normalize_account_number(payload.get("accountNumber"))
+    payment_code = _extract_payment_code(payload)
+    now = timezone.now()
+
+    payment, created = Payment.objects.get_or_create(
+        sepay_transaction_id=transaction_id,
+        defaults={
+            "amount": amount,
+            "content": str(payload.get("content") or ""),
+            "status": Payment.Status.PENDING,
+            "gateway": str(payload.get("gateway") or ""),
+            "account_number": account_number,
+            "transfer_type": transfer_type,
+            "reference_number": str(payload.get("referenceCode") or ""),
+            "raw_payload": payload,
+        },
+    )
+    if not created:
+        return {"result": "duplicate", "payment": payment, "order": payment.order}
+
+    if transfer_type != "in":
+        payment.status = Payment.Status.IGNORED
+        payment.processed_at = now
+        payment.save(update_fields=["status", "processed_at", "updated_at"])
+        return {"result": "ignored", "payment": payment, "order": None}
+
+    # SePay reports the master account in `accountNumber` and the virtual one in
+    # `subAccount`, but which field carries which varies by bank, so accept the
+    # transfer when either configured number appears in either field. Both are
+    # ours; what must never pass is a transfer into somebody else's account.
+    expected_accounts = {
+        normalize_account_number(getattr(settings, "SEPAY_ACCOUNT_NUMBER", "")),
+        normalize_account_number(getattr(settings, "SEPAY_VIRTUAL_ACCOUNT", "")),
+    } - {""}
+    reported_accounts = {account_number, normalize_account_number(payload.get("subAccount"))} - {""}
+    if not expected_accounts or not (reported_accounts & expected_accounts):
+        payment.status = Payment.Status.FAILED
+        payment.processed_at = now
+        payment.save(update_fields=["status", "processed_at", "updated_at"])
+        return {"result": "account_mismatch", "payment": payment, "order": None}
+
+    from developer_api.topups import extract_topup_code, settle_verified_payment
+
+    topup_code = extract_topup_code(payload)
+    if topup_code:
+        topup_result = settle_verified_payment(payment=payment, code=topup_code, now=now)
+        if topup_result is not None:
+            return {"result": f"api_topup_{topup_result}", "payment": payment, "order": None}
+
+    order = None
+    if payment_code:
+        order = (
+            PaymentOrder.objects.select_for_update()
+            .select_related("plan", "user")
+            .filter(payment_code=payment_code)
+            .first()
+        )
+
+    if not order:
+        payment.status = Payment.Status.UNMATCHED
+        payment.processed_at = now
+        payment.save(update_fields=["status", "processed_at", "updated_at"])
+        return {"result": "unmatched", "payment": payment, "order": None}
+
+    payment.order = order
+    payment.user = order.user
+    payment.plan_requested = order.plan.slug
+    payment.old_plan = order.user.current_plan
+    order.amount_received += amount
+
+    if order.status == PaymentOrder.Status.PAID:
+        payment.status = Payment.Status.OVERPAID
+        payment.processed_at = now
+        payment.save(
+            update_fields=[
+                "order",
+                "user",
+                "plan_requested",
+                "old_plan",
+                "status",
+                "processed_at",
+                "updated_at",
+            ]
+        )
+        order.save(update_fields=["amount_received", "updated_at"])
+        return {"result": "already_paid", "payment": payment, "order": order}
+
+    if order.status in (PaymentOrder.Status.CANCELLED, PaymentOrder.Status.EXPIRED) or order.expires_at <= now:
+        order.status = PaymentOrder.Status.REVIEW
+        order.save(update_fields=["status", "amount_received", "updated_at"])
+        payment.status = Payment.Status.LATE
+        payment.processed_at = now
+        payment.save(
+            update_fields=[
+                "order",
+                "user",
+                "plan_requested",
+                "old_plan",
+                "status",
+                "processed_at",
+                "updated_at",
+            ]
+        )
+        return {"result": "late", "payment": payment, "order": order}
+
+    if order.amount_received < order.amount_expected:
+        order.status = PaymentOrder.Status.UNDERPAID
+        payment.status = Payment.Status.UNDERPAID
+        result = "underpaid"
+    elif order.amount_received > order.amount_expected:
+        order.status = PaymentOrder.Status.OVERPAID
+        payment.status = Payment.Status.OVERPAID
+        result = "overpaid"
+    else:
+        old_plan, _ = _activate_locked_order(order, now)
+        payment.old_plan = old_plan
+        payment.status = Payment.Status.SUCCESS
+        result = "paid"
+
+    if result != "paid":
+        order.save(update_fields=["status", "amount_received", "updated_at"])
+    payment.processed_at = now
+    payment.save(
+        update_fields=[
+            "order",
+            "user",
+            "plan_requested",
+            "old_plan",
+            "status",
+            "processed_at",
+            "updated_at",
+        ]
+    )
+    return {"result": result, "payment": payment, "order": order}

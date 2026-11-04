@@ -1,0 +1,325 @@
+# Agromind AI - webchuandoanla
+
+Agromind AI là ứng dụng chẩn đoán ảnh lá cây và hỗ trợ canh tác. Repo này chứa cả frontend Next.js và backend Django để người clone về có thể chạy local, phát triển tiếp và deploy.
+
+Repo GitHub: https://github.com/manhfaa/webchuandoanla
+
+## Tính năng hiện có
+
+- Chẩn đoán ảnh lá: upload ảnh, chụp bằng camera, dùng ảnh mẫu, nén ảnh trước upload.
+- YOLO xác thực ảnh lá và CNN trả top 5 kết quả bệnh/cây.
+- Cảnh báo độ tin cậy CNN bằng màu xanh/đỏ, cảnh báo khi confidence dưới 70%.
+- Khuyến nghị hành động sau chẩn đoán: mức rủi ro, việc cần làm ngay, theo dõi 3-7 ngày, khi nào hỏi chuyên gia, có nên chụp lại ảnh, lưu ý an toàn.
+- Chat AI qua DeepSeek nếu có `DEEPSEEK_API_KEY`, fallback local nếu chưa cấu hình.
+- Giọng nói: nút micro hỏi bằng tiếng Việt và đọc kết quả chẩn đoán.
+- Hỗ trợ mạng yếu: trạng thái online/offline, lưu tạm và gửi lại khi có mạng.
+- Thời tiết và cảnh báo sâu bệnh theo tỉnh/huyện/xã/vị trí canh tác.
+- Dự báo 3 ngày, 7 ngày, độ ẩm, nhiệt độ, mưa, gió và gợi ý tưới/bón/phun hôm nay.
+- Kế hoạch canh tác theo cây trồng, vị trí, thời tiết và tiến độ thực hiện.
+- Lô vườn/ruộng, nhật ký tưới nước, bón phân, phun thuốc, kiểm tra sâu bệnh.
+- Liên kết kết quả chẩn đoán với lô vườn.
+- QR truy xuất nguồn gốc và trang công khai cho QR.
+- Thư viện vật tư: thuốc BVTV, phân bón, dinh dưỡng cây trồng, triệu chứng thiếu dinh dưỡng.
+- Search/filter theo cây, bệnh, hoạt chất, loại vật tư.
+- Gợi ý vật tư liên quan trong trang kết quả chẩn đoán.
+- Song ngữ Việt/Anh, lưu lựa chọn ngôn ngữ bằng localStorage.
+- Đăng nhập/đăng ký thật bằng backend Django JWT.
+
+## Công nghệ
+
+- Frontend: Next.js App Router, TypeScript, Tailwind CSS, Zustand.
+- Backend: Django, Django REST Framework, Simple JWT.
+- Database: SQLite local mặc định hoặc PostgreSQL/Supabase qua `SUPABASE_DB_URL`.
+- CNN: chạy local bằng `agromindaimodel.pth` hoặc gọi Hugging Face Space qua `CNN_API_URL`.
+- Production: Vercel cho frontend, Nhân Hòa VPS cho backend Django, Supabase PostgreSQL và Hugging Face Space cho CNN/YOLO.
+
+## Cấu trúc chính
+
+```text
+.
+├─ src/                         Frontend Next.js
+│  ├─ app/                      Routes App Router
+│  ├─ components/               UI và feature components
+│  ├─ hooks/                    Voice, online status
+│  ├─ lib/                      API clients, i18n, offline queue, compression
+│  ├─ locales/                  Bản dịch Việt/Anh
+│  ├─ store/                    Zustand stores
+│  └─ types/                    TypeScript types
+├─ backend/                     Django backend
+│  ├─ core/                     Settings, urls, asgi, wsgi
+│  ├─ users/                    Auth, profile, settings
+│  ├─ diagnoses/                Diagnosis, CNN, action plan
+│  ├─ engagement/               Plans, chat, expert consultation
+│  ├─ crop_plans/               Kế hoạch canh tác, thời tiết, nhắc việc
+│  ├─ farmops/                  Lô vườn, nhật ký, QR, thư viện vật tư
+│  └─ requirements.txt
+├─ hf_space/                    FastAPI Space cho CNN
+├─ scripts/deploy_hf_space.py   Script deploy Hugging Face Space
+├─ DEPLOY_FREE.md               Ghi chú deploy miễn phí
+├─ render.yaml                  Cấu hình Render cũ, không dùng cho production hiện tại
+├─ vercel.json                  Cấu hình Vercel frontend
+├─ agromindaimodel.pth          CNN checkpoint local
+└─ README.md
+```
+
+## Yêu cầu môi trường
+
+- Node.js `20+`
+- npm `10+`
+- Python `3.13.x`
+- pip
+- Git
+
+PostgreSQL/Supabase là tùy chọn. Nếu không có `SUPABASE_DB_URL`, backend dùng SQLite local.
+
+## Clone và cài đặt
+
+```bash
+git clone https://github.com/manhfaa/webchuandoanla.git
+cd webchuandoanla
+npm install
+```
+
+Cài backend trên Windows PowerShell:
+
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+cd ..
+```
+
+Cài backend trên macOS/Linux:
+
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cd ..
+```
+
+## Cấu hình môi trường
+
+Tạo env frontend:
+
+```powershell
+copy .env.example .env.local
+```
+
+Tạo env backend:
+
+```powershell
+copy backend\.env.example backend\.env
+```
+
+Các biến quan trọng:
+
+```env
+# Frontend
+DJANGO_BASE_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
+DEEPSEEK_API_KEY=
+DEEPSEEK_MODEL=deepseek-v4-flash
+
+# Backend
+SECRET_KEY=change-me
+DEBUG=True
+ALLOWED_HOSTS=127.0.0.1,localhost
+SUPABASE_DB_URL=
+CNN_MODEL_PATH=
+CNN_API_URL=
+CNN_API_TOKEN=
+FRONTEND_ORIGIN=http://127.0.0.1:3000
+CORS_ALLOWED_ORIGINS=
+CSRF_TRUSTED_ORIGINS=
+```
+
+Không commit `.env`, `.env.local`, token DeepSeek hoặc Hugging Face thật.
+
+## Database
+
+Chạy migration:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe manage.py migrate
+cd ..
+```
+
+Nếu dùng macOS/Linux:
+
+```bash
+cd backend
+.venv/bin/python manage.py migrate
+cd ..
+```
+
+## Chạy local
+
+Mở 2 terminal.
+
+Terminal backend:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000
+```
+
+Terminal frontend:
+
+```powershell
+npm run dev
+```
+
+URL local:
+
+- Frontend: http://127.0.0.1:3000
+- Trang chẩn đoán: http://127.0.0.1:3000/dashboard/diagnosis
+- Backend admin: http://127.0.0.1:8000/admin/login/
+
+## Tài khoản đăng nhập
+
+Đăng ký tài khoản người dùng tại `/register`. Không lưu hoặc công khai thông tin đăng nhập thật trong mã nguồn và tài liệu.
+
+Để cấp tài khoản quản trị khi triển khai, cấu hình `DJANGO_SUPERUSER_USERNAME`, `DJANGO_SUPERUSER_EMAIL` và `DJANGO_SUPERUSER_PASSWORD` trong biến môi trường backend trên VPS. Lệnh `python manage.py provision_admin` sẽ tạo hoặc cập nhật tài khoản mà không ghi mật khẩu vào Git hay log triển khai.
+
+## CNN model
+
+Backend ưu tiên theo thứ tự:
+
+1. Gọi remote CNN FastAPI nếu có `CNN_API_URL`.
+2. Chạy local checkpoint nếu có `CNN_MODEL_PATH` hoặc file `agromindaimodel.pth` ở root repo.
+
+File `agromindaimodel.pth` là checkpoint ConvNeXt-Tiny mới. Nếu muốn deploy nhẹ hơn, đưa model lên Hugging Face Space và set:
+
+```env
+CNN_API_URL=https://username-agromind-cnn-api.hf.space
+CNN_API_TOKEN=
+```
+
+Deploy Hugging Face Space:
+
+```powershell
+$env:HF_TOKEN="your_huggingface_token"
+python scripts\deploy_hf_space.py
+```
+
+## DeepSeek chat
+
+Chat AI dùng DeepSeek qua biến:
+
+```env
+DEEPSEEK_API_KEY=your_key
+DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+Nếu không có key, app vẫn dùng fallback local để trả lời cơ bản.
+
+## Kiểm tra trước khi commit
+
+Frontend:
+
+```powershell
+npm run build
+```
+
+Backend:
+
+```powershell
+backend\.venv\Scripts\python.exe backend\manage.py makemigrations --check --dry-run
+backend\.venv\Scripts\python.exe backend\manage.py check
+backend\.venv\Scripts\python.exe backend\manage.py migrate --noinput
+```
+
+## API chính
+
+Auth:
+
+- `POST /api/auth/google/` với Google ID token, `accepted_terms` và `turnstile_token` khi tạo tài khoản mới. Django xác minh token Google, email đã xác minh và Turnstile trước khi cấp tài khoản.
+- `POST /api/auth/register/` mặc định trả 410; chỉ bật lại đăng ký email nếu đặt `PASSWORD_REGISTRATION_ENABLED=true` và đã cấu hình dịch vụ gửi email thật.
+- `POST /api/auth/verify-email/` và `/api/auth/verify-email/resend/` chỉ phục vụ luồng đăng ký email khi được bật lại.
+- `POST /api/auth/login/`
+- `GET /api/users/me/`
+
+Đăng ký production dùng Google-only; đăng nhập email/mật khẩu tiếp tục phục vụ tài khoản cũ. Cấu hình cùng Google OAuth Web Client ID ở `NEXT_PUBLIC_GOOGLE_CLIENT_ID` trên Vercel và `GOOGLE_CLIENT_ID` trên Django. Tạo Turnstile widget cho hostname trong `FRONTEND_ORIGIN`, đặt site key trên Vercel và secret key chỉ trên VPS. Nếu thiếu secret, Django từ chối tạo tài khoản. Chạy migration `users.0009` trước khi mở đăng ký. Cấu hình Cloudflare WAF giới hạn POST `/api/auth/google/` theo IP thực; khi Vercel đứng sau Cloudflare, IP Vercel chuyển tiếp có thể là IP proxy dùng chung, nên đặt `REGISTRATION_IP_HOURLY_LIMIT=0` để tránh chặn nhầm. Bộ lọc mẫu email/user-agent vẫn hoạt động. Log và bảng quản trị `RegistrationAttempt` ghi các lần đăng ký; cảnh báo email từ Django cần dịch vụ gửi mail thật và `REGISTRATION_ALERT_EMAIL`, hoặc dùng cảnh báo WAF của Cloudflare. `REGISTRATION_PROXY_SECRET` chỉ có ích khi xác nhận được IP Vercel nhìn thấy là IP khách thực; nếu dùng thì đặt cùng giá trị ở Vercel/VPS, không có tiền tố `NEXT_PUBLIC_`.
+
+Android chuyển sang đăng ký bằng Google; cần đặt Google Web Client ID khi build app và kiểm tra luồng xác minh Turnstile trước khi phát hành APK. Backend không miễn kiểm tra Turnstile cho Android.
+
+Diagnoses:
+
+- `GET /api/diagnoses/`
+- `POST /api/diagnoses/`
+- `GET /api/diagnoses/{id}/`
+- `PATCH /api/diagnoses/{id}/`
+- `DELETE /api/diagnoses/{id}/`
+
+Crop plans:
+
+- `GET /api/crop-plans/crops/`
+- `GET /api/crop-plans/locations/`
+- `POST /api/crop-plans/locations/`
+- `POST /api/crop-plans/preview/`
+- `GET /api/crop-plans/plans/`
+- `POST /api/crop-plans/plans/`
+- `POST /api/crop-plans/steps/{id}/complete/`
+- `POST /api/crop-plans/steps/{id}/delay/`
+- `GET /api/crop-plans/reminders/`
+
+Farmops:
+
+- `GET /api/farmops/locations/`
+- `POST /api/farmops/locations/`
+- `GET /api/farmops/plots/`
+- `POST /api/farmops/plots/`
+- `GET /api/farmops/cultivation-logs/`
+- `POST /api/farmops/cultivation-logs/`
+- `GET /api/farmops/traceability/`
+- `POST /api/farmops/traceability/`
+- `GET /api/farmops/traceability/public/{token}/`
+- `GET /api/farmops/weather-alerts/`
+- `GET /api/farmops/input-library/`
+- `GET /api/farmops/nutrition-symptoms/`
+
+Engagement:
+
+- `GET /api/engagement/plans/`
+- `GET /api/engagement/subscriptions/`
+- `POST /api/engagement/verify-transfer/`
+- `GET /api/engagement/conversations/`
+- `POST /api/engagement/messages/`
+- `GET /api/engagement/expert-consultations/`
+
+## Production deployment
+
+`DEPLOY_FREE.md` mô tả cấu hình Render cũ và chỉ còn giá trị tham khảo lịch sử.
+
+Gợi ý cấu hình:
+
+- Frontend: Vercel, build `npm run build`.
+- Backend: Nhân Hòa Ubuntu VPS, Nginx + Gunicorn + systemd service `agromind-backend`.
+- Database: Supabase Postgres hoặc SQLite cho local.
+- CNN: Hugging Face Space free.
+- DeepSeek: set `DEEPSEEK_API_KEY` và `DEEPSEEK_MODEL` trong Vercel env.
+- Cloudflare: xem `CLOUDFLARE_SECURITY.md` để bật proxy, SSL strict, WAF/rate limit và cập nhật domain production.
+
+Backend VPS cần các biến chính:
+
+```env
+DEBUG=False
+ALLOWED_HOSTS=api.agromind.farm
+FRONTEND_ORIGIN=https://www.agromind.farm
+CORS_ALLOWED_ORIGINS=https://agromind.farm,https://www.agromind.farm
+CSRF_TRUSTED_ORIGINS=https://api.agromind.farm,https://agromind.farm,https://www.agromind.farm
+SUPABASE_DB_URL=postgresql://...
+CNN_API_URL=https://username-agromind-cnn-api.hf.space
+```
+
+## Ghi chú phát triển
+
+- Không đưa secret thật vào GitHub.
+- Không commit `node_modules`, `.next`, `backend/.venv`, database SQLite local.
+- Khi thêm model lớn mới, ưu tiên Hugging Face Space hoặc Git LFS.
+- Nếu đổi schema backend, tạo migration và chạy `migrate`.
+- Nếu thêm text giao diện, giữ tiếng Việt có dấu và cập nhật i18n khi cần.

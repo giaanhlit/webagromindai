@@ -1,0 +1,331 @@
+"use client";
+
+import type { CSSProperties } from "react";
+
+import { ExternalLink, Leaf, LockKeyhole, Sparkles } from "lucide-react";
+
+import { Badge, StatusBadge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { ConfidenceMeter } from "@/components/ui/confidence-meter";
+import { PredictionBands, type BandPrediction } from "@/components/diagnosis/prediction-bands";
+import { SourceList } from "@/components/ui/source-list";
+import { EmptyState } from "@/components/ui/states";
+import { toUserFacingText } from "@/lib/user-facing-copy";
+import { withViFallback } from "@/lib/crop-plan-labels";
+import { safeExternalUrl } from "@/lib/safe-external-url";
+import { useTr } from "@/lib/use-tr";
+import { formatConfidence } from "@/lib/utils";
+import type { DiagnosisRecord } from "@/types";
+
+type Tr = (vi: string, en: string) => string;
+
+type ResearchSource = { id?: number; title?: string; url?: string };
+type ResearchPayload = { compatibilitySources?: ResearchSource[]; treatmentSources?: ResearchSource[] };
+
+/**
+ * Bilingual plant/disease names.
+ *
+ * The classifier stores its raw answer on `record.cnnPayload`, which is a loose
+ * `Record<string, unknown>`. Alongside the Vietnamese `plant_name`/`disease_name`
+ * it also carries `plant_name_en`/`disease_name_en` (top level and for every
+ * entry of `top_predictions`). Older records were saved before those English
+ * fields existed, so every reader below falls back to the Vietnamese value.
+ */
+type CnnNames = {
+  plant_name: string;
+  disease_name: string;
+  plant_name_en: string;
+  disease_name_en: string;
+};
+
+function readString(source: Record<string, unknown>, key: string): string {
+  const value = source[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function toCnnNames(value: unknown): CnnNames | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  return {
+    plant_name: readString(source, "plant_name"),
+    disease_name: readString(source, "disease_name"),
+    plant_name_en: readString(source, "plant_name_en"),
+    disease_name_en: readString(source, "disease_name_en"),
+  };
+}
+
+/**
+ * The raw candidate list, for the severity bands. Read straight off the saved
+ * payload rather than parsed back out of the recommendation strings, which are
+ * prose and were never meant to be a data format.
+ */
+function bandPredictions(record: DiagnosisRecord): BandPrediction[] {
+  const raw = record.cnnPayload?.top_predictions;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((item): item is BandPrediction => Boolean(item) && typeof item === "object");
+}
+
+/** The payload itself first, then each `top_predictions` entry. */
+function cnnNameEntries(record: DiagnosisRecord): CnnNames[] {
+  const payload = record.cnnPayload;
+  if (!payload) return [];
+  const entries: CnnNames[] = [];
+  const root = toCnnNames(payload);
+  if (root) entries.push(root);
+  const predictions = payload.top_predictions;
+  if (Array.isArray(predictions)) {
+    for (const prediction of predictions) {
+      const parsed = toCnnNames(prediction);
+      if (parsed) entries.push(parsed);
+    }
+  }
+  return entries;
+}
+
+function englishName(record: DiagnosisRecord, vietnamese: string, field: "plant" | "disease"): string {
+  const viKey = field === "plant" ? "plant_name" : "disease_name";
+  const enKey = field === "plant" ? "plant_name_en" : "disease_name_en";
+  const entries = cnnNameEntries(record);
+  if (!vietnamese) return entries[0]?.[enKey] ?? "";
+  return entries.find((entry) => entry[viKey] === vietnamese && entry[enKey])?.[enKey] ?? "";
+}
+
+/** Raw English plant name from the stored payload, or `""` when unavailable. */
+export function englishPlantName(record: DiagnosisRecord): string {
+  return englishName(record, (record.plant ?? "").trim(), "plant");
+}
+
+/** Raw English disease name from the stored payload, or `""` when unavailable. */
+export function englishDiseaseName(record: DiagnosisRecord): string {
+  return englishName(record, (record.disease ?? "").trim(), "disease");
+}
+
+export function displayPlantName(record: DiagnosisRecord, tr: Tr): string {
+  const vi = (record.plant ?? "").trim();
+  const en = englishPlantName(record);
+  return tr(vi || en, en || vi);
+}
+
+export function displayDiseaseName(record: DiagnosisRecord, tr: Tr): string {
+  const vi = (record.disease ?? "").trim();
+  const en = englishDiseaseName(record);
+  return tr(vi || en, en || vi);
+}
+
+/**
+ * The "other possibilities" list is stored as pre-rendered lines shaped like
+ * `"<plant> - <disease>: 92%"`. Only the leading name pair is swapped; the
+ * confidence tail is left untouched. Unmatched lines are returned as-is.
+ */
+export function translatePredictionLine(line: string, record: DiagnosisRecord, tr: Tr): string {
+  for (const entry of cnnNameEntries(record)) {
+    if (!entry.disease_name) continue;
+    const prefix = `${entry.plant_name || "Cây"} - ${entry.disease_name}`;
+    if (!line.startsWith(prefix)) continue;
+    const rest = line.slice(prefix.length);
+    if (rest && !rest.startsWith(":")) continue;
+    const plantEn = entry.plant_name_en || entry.plant_name;
+    const diseaseEn = entry.disease_name_en || entry.disease_name;
+    const translated = `${tr(entry.plant_name || "Cây", plantEn || "Plant")} - ${tr(entry.disease_name, diseaseEn)}`;
+    return `${translated}${rest}`;
+  }
+  return line;
+}
+
+function getResearchSources(record: DiagnosisRecord) {
+  const payload = record.cnnPayload?.tavily_research as ResearchPayload | null | undefined;
+  const sourceMap = new Map<string, ResearchSource>();
+  for (const source of [...(payload?.compatibilitySources ?? []), ...(payload?.treatmentSources ?? [])]) {
+    const url = safeExternalUrl(source.url);
+    if (url && !sourceMap.has(url)) sourceMap.set(url, { ...source, url });
+  }
+  return Array.from(sourceMap.values()).slice(0, 6);
+}
+
+function sourceDomain(url: string | undefined, tr: Tr) {
+  const unnamed = tr("Nguồn tham khảo", "Reference source");
+  if (!url) return unnamed;
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return unnamed;
+  }
+}
+
+function customerTitle(title: string, tr: Tr) {
+  return toUserFacingText(title
+    .replace(/Top 5 CNN[^:]*/gi, tr("Các khả năng khác từ ảnh", "Other possibilities from the photo"))
+    .replace(/Kết luận cuối cùng từ DeepSeek/gi, tr("Kết luận sau khi đối chiếu", "Conclusion after cross-checking"))
+    .replace(/Kiểm chứng triệu chứng bằng Tavily/gi, tr("Đối chiếu triệu chứng với nguồn tham khảo", "Symptoms cross-checked against reference sources")));
+}
+
+function customerText(text: string) {
+  return toUserFacingText(text);
+}
+
+function renderRecommendationItem(rawItem: string, tr: Tr, record: DiagnosisRecord) {
+  const item = translatePredictionLine(customerText(rawItem), record, tr);
+  const sourceMatch = item.match(/^(\[\d+\])\s*(.*?):\s*(https?:\/\/\S+)$/);
+  if (sourceMatch) {
+    const [, index, title, url] = sourceMatch;
+    return <a href={url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 font-semibold text-leaf-strong hover:text-leaf"><span>{index} {title}</span><ExternalLink size={13} aria-hidden /></a>;
+  }
+  const urlMatch = item.match(/https?:\/\/\S+/);
+  if (urlMatch) {
+    const url = urlMatch[0];
+    return <span>{item.slice(0, urlMatch.index)}<a href={url} target="_blank" rel="noreferrer" className="font-semibold text-leaf-strong hover:text-leaf">{tr("Mở nguồn tham khảo", "Open reference source")} <ExternalLink className="inline h-3.5 w-3.5" aria-hidden /></a></span>;
+  }
+  return <span>{item}</span>;
+}
+
+export function DiagnosisResultCard({
+  record,
+  locked,
+  onUpgrade,
+  detailsOnly = false,
+}: {
+  record: DiagnosisRecord | null;
+  locked?: boolean;
+  onUpgrade?: () => void;
+  detailsOnly?: boolean;
+}) {
+  const tr = useTr();
+  if (!record) {
+    return (
+      <Card variant="raised" padding="lg" className="rounded-xl">
+        <EmptyState title={tr("Kết quả sẽ xuất hiện tại đây", "Results will appear here")} description={tr("Chọn hoặc chụp ảnh lá, sau đó hoàn tất các bước kiểm tra để xem gợi ý và việc nên làm.", "Choose or capture a leaf photo, then complete the check steps to see suggestions and what to do.")} icon={Leaf} />
+      </Card>
+    );
+  }
+
+  const confidence = record.cnnConfidence ?? record.confidence ?? 0;
+  const sources = getResearchSources(record);
+  const sourceItems = sources
+    .filter((source): source is ResearchSource & { url: string } => Boolean(source.url))
+    .map((source, index) => ({
+      title: `[${source.id ?? index + 1}] ${source.title || sourceDomain(source.url, tr)}`,
+      url: source.url,
+      domain: sourceDomain(source.url, tr),
+    }));
+  const recommendationSections = detailsOnly
+    ? record.recommendations.filter((section) => !/khuyến nghị hành động|bạn có thể làm tiếp|để ảnh rõ hơn/i.test(section.title))
+    : record.recommendations;
+  const status = confidence >= 0.7 ? { state: "healthy" as const, label: tr("Tin cậy cao", "High confidence") } : { state: "watch" as const, label: tr("Cần theo dõi", "Worth watching") };
+
+  return (
+    <Card variant="raised" padding="lg" className="overflow-hidden rounded-xl">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <p className="text-overline text-leaf-strong">{detailsOnly ? tr("Thông tin bổ sung", "Additional information") : tr("Bước 4 · Kết quả", "Step 4 · Results")}</p>
+          <h2 className="mt-2 font-display text-[30px] font-bold tracking-[-0.035em] text-ink">{detailsOnly ? tr("Các khả năng khác và nguồn đối chiếu", "Other possibilities and reference sources") : tr("Kết quả kiểm tra ảnh lá", "Leaf photo check results")}</h2>
+          <p className="mt-2 text-sm text-ink-soft">{detailsOnly ? tr("Xem thêm cơ sở tham khảo cho kết luận chính ở trên.", "See more reference basis for the main conclusion above.") : tr("Xem gợi ý chính, mức tin cậy và các bước nên thực hiện tiếp theo.", "See the main suggestion, confidence level, and the next steps to take.")}</p>
+        </div>
+        {!detailsOnly ? <StatusBadge status={status.state} label={status.label} /> : null}
+      </div>
+
+      {detailsOnly ? (
+        <div className="mt-5 grid gap-4 rounded-xl border border-leaf/20 bg-surface-soft p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+          <div>
+            <p className="text-overline text-leaf-strong">{tr("Kết luận chính", "Main conclusion")}</p>
+            <p className="mt-2 font-display text-2xl font-bold leading-tight tracking-[-0.03em] text-ink">
+              {displayDiseaseName(record, tr) || tr("Chưa có gợi ý bệnh", "No disease suggestion yet")}
+            </p>
+            <p className="mt-2 text-sm text-ink-soft">
+              {tr("Cây được nhận diện:", "Recognized plant:")} {displayPlantName(record, tr) || tr("Chưa xác định", "Not identified")}
+            </p>
+          </div>
+          <div className="flex items-center gap-3 sm:flex-col sm:items-end">
+            <StatusBadge status={status.state} label={status.label} />
+            <span className="text-sm font-bold text-ink">{formatConfidence(confidence)}</span>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="mt-6 grid gap-5 xl:grid-cols-[0.86fr_1.14fr]">
+        <div className="space-y-4">
+          {!detailsOnly ? <div className="fl-rise field-contours relative overflow-hidden rounded-xl bg-forest p-6 text-on-forest">
+            <Badge className="bg-on-forest/10 text-on-forest">{displayPlantName(record, tr) || tr("Chưa xác định cây", "Plant not identified")}</Badge>
+            <p className="mt-6 text-overline text-on-forest-muted">{tr("Khả năng cao nhất", "Most likely")}</p>
+            <h3 className="mt-2 font-display text-[30px] font-bold leading-tight tracking-[-0.03em] text-on-forest">{displayDiseaseName(record, tr) || tr("Chưa có gợi ý bệnh", "No disease suggestion yet")}</h3>
+            <ConfidenceMeter score={confidence} tone="dark" className="mt-6" />
+            <div className="mt-5 grid grid-cols-2 gap-3 border-t border-on-forest/10 pt-5 text-sm">
+              <div><p className="text-xs text-on-forest-muted">{tr("Ảnh đầu vào", "Input photo")}</p><p className="mt-1 font-semibold text-on-forest">{tr("Ảnh lá hợp lệ", "Valid leaf photo")}</p></div>
+              <div><p className="text-xs text-on-forest-muted">{tr("Nguồn ảnh", "Photo source")}</p><p className="mt-1 font-semibold text-on-forest">{record.inputMethod === "capture" ? tr("Ảnh chụp", "Captured photo") : tr("Ảnh tải lên", "Uploaded photo")}</p></div>
+            </div>
+          </div> : null}
+
+          {sourceItems.length ? (
+            <div className="rounded-xl border border-line bg-surface-soft p-5">
+              <p className="text-overline text-leaf-strong">{tr("Nguồn tham khảo", "Reference sources")}</p>
+              <p className="mt-2 text-xs leading-6 text-ink-soft">{tr("Mở nguồn để tự đối chiếu thông tin đã được tổng hợp.", "Open the sources to cross-check the compiled information yourself.")}</p>
+              <div className="mt-3"><SourceList sources={sourceItems} /></div>
+            </div>
+          ) : detailsOnly ? <EmptyState title={tr("Chưa có nguồn đối chiếu", "No reference sources yet")} description={tr("Nguồn tham khảo chỉ xuất hiện khi bạn nhập triệu chứng và bước đối chiếu hoàn tất.", "Reference sources appear only after you enter symptoms and the cross-check step is complete.")} icon={ExternalLink} /> : null}
+        </div>
+
+        <div className="space-y-4">
+          {!detailsOnly ? <div className="rounded-xl bg-surface-soft p-5">
+            <p className="text-sm font-bold text-ink">{tr("Tình trạng hiện tại", "Current condition")}</p>
+            <p className="mt-3 text-sm leading-7 text-ink-soft">{customerText(tr(record.symptomSummary, withViFallback(record.symptomSummary, record.symptomSummaryEn)))}</p>
+          </div> : null}
+
+          <div className="rounded-xl border border-line bg-surface p-5">
+            <p className="flex items-center gap-2 text-sm font-bold text-ink"><Sparkles size={16} className="text-leaf-strong" aria-hidden /> {detailsOnly ? tr("Thông tin đã đối chiếu", "Cross-checked information") : tr("Giải thích và việc nên làm", "Explanation and what to do")}</p>
+            <div className="mt-5 space-y-5">
+              {recommendationSections.map((section, sectionIndex) => {
+                // The candidate list is the one block rendered from structured
+                // data rather than its prose. Its saved strings still carry the
+                // percentages so history and chat context are unchanged; they
+                // are just not what gets drawn.
+                const isCandidateList = /khả năng/i.test(section.title);
+                const bands = isCandidateList ? bandPredictions(record) : [];
+                const looksLikeCandidateLine = (item: string) => /:\s*\d+([.,]\d+)?\s*%/.test(item);
+                const proseItems = section.items
+                  .filter((item) => customerText(item).trim())
+                  .filter((item) => !(isCandidateList && bands.length && looksLikeCandidateLine(item)));
+
+                return (
+                  <section key={section.title} className="fl-rise" style={{ "--fl-i": sectionIndex + 1 } as CSSProperties}>
+                    <h4 className="text-sm font-bold text-ink">{customerTitle(section.title, tr)}</h4>
+                    {proseItems.length ? (
+                      <ul className="mt-2 space-y-2">
+                        {proseItems.slice(0, locked ? 1 : proseItems.length).map((item) => (
+                          <li key={item} className="flex gap-2 rounded-lg bg-surface-soft px-3 py-3 text-sm leading-7 text-ink-soft">
+                            <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-leaf" aria-hidden />
+                            <span>{renderRecommendationItem(item, tr, record)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {isCandidateList && bands.length && !locked ? (
+                      <div className="mt-2">
+                        <PredictionBands predictions={bands} />
+                        <p className="mt-2 text-xs leading-6 text-ink-muted">
+                          {tr(
+                            "Màu cho biết mức độ nặng của bệnh, độ dài cho biết ảnh khớp đến đâu.",
+                            "Color shows how serious the disease is; length shows how well the photo matches.",
+                          )}
+                        </p>
+                      </div>
+                    ) : null}
+                  </section>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {locked && !detailsOnly ? (
+        <div className="mt-5 flex flex-col items-start justify-between gap-4 rounded-xl border border-line bg-surface-soft p-5 sm:flex-row sm:items-center">
+          <div className="flex items-start gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-surface text-leaf-strong"><LockKeyhole size={18} aria-hidden /></span>
+            <div><p className="text-sm font-bold text-ink">{tr("Mở rộng phần hỏi đáp về kết quả", "Expand the Q&A about your results")}</p><p className="mt-1 text-xs leading-6 text-ink-soft">{tr("Bạn vẫn xem được kết quả chính. Nâng cấp nếu muốn dùng thêm hỗ trợ trò chuyện theo ca đã lưu.", "You can still see the main results. Upgrade if you want added chat support based on your saved cases.")}</p></div>
+          </div>
+          <Button size="sm" onClick={onUpgrade}>{tr("Xem gói phù hợp", "See suitable plans")}</Button>
+        </div>
+      ) : null}
+    </Card>
+  );
+}

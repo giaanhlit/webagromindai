@@ -1,0 +1,1018 @@
+import os
+import hashlib
+import hmac
+from datetime import timedelta
+from io import StringIO
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from django.conf import settings as django_settings
+from django.contrib.auth import get_user_model
+from django.core import mail
+from django.core.cache import cache
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.db import IntegrityError, transaction
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from .models import TERMS_VERSION, EmailVerificationToken, PasswordResetToken, RegistrationAttempt, WebSession
+from .registration_security import _client_ip
+from .throttling import GoogleLoginRateThrottle, LoginIPRateThrottle, PasswordResetRateThrottle
+from core.admin_guard import client_ip as admin_client_ip
+
+PASSWORD = "StrongPass#2026"
+NEW_PASSWORD = "AnotherPass#2026"
+
+
+class RegistrationIpTrustTests(TestCase):
+    def test_spoofed_forwarding_headers_do_not_change_throttle_identity(self):
+        request = SimpleNamespace(META={
+            "REMOTE_ADDR": "198.51.100.2",
+            "HTTP_X_FORWARDED_FOR": "203.0.113.8",
+            "HTTP_CF_CONNECTING_IP": "203.0.113.9",
+        })
+        self.assertEqual(admin_client_ip(request), "198.51.100.2")
+        for throttle in (LoginIPRateThrottle(), GoogleLoginRateThrottle(), PasswordResetRateThrottle()):
+            self.assertIn("198.51.100.2", throttle.get_cache_key(request, None))
+
+    @override_settings(REGISTRATION_PROXY_SECRET="shared-test-secret")
+    def test_only_signed_proxy_ip_is_trusted(self):
+        request = SimpleNamespace(META={"REMOTE_ADDR": "198.51.100.2", "HTTP_X_AGROMIND_CLIENT_IP": "203.0.113.5"})
+        self.assertEqual(_client_ip(request), "198.51.100.2")
+        request.META["HTTP_X_AGROMIND_IP_SIGNATURE"] = hmac.new(
+            b"shared-test-secret", b"203.0.113.5", hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(_client_ip(request), "203.0.113.5")
+        self.assertEqual(admin_client_ip(request), "198.51.100.2")
+
+
+class ProvisionAdminCommandTests(TestCase):
+    env_names = (
+        "DJANGO_SUPERUSER_USERNAME",
+        "DJANGO_SUPERUSER_EMAIL",
+        "DJANGO_SUPERUSER_PASSWORD",
+    )
+
+    def test_skips_when_environment_is_not_configured(self):
+        environment = {name: "" for name in self.env_names}
+        output = StringIO()
+
+        with patch.dict(os.environ, environment, clear=False):
+            call_command("provision_admin", stdout=output)
+
+        self.assertEqual(get_user_model().objects.count(), 0)
+        self.assertIn("skipped", output.getvalue())
+
+    def test_creates_and_updates_admin_without_logging_credentials(self):
+        environment = {
+            "DJANGO_SUPERUSER_USERNAME": "deployment-admin",
+            "DJANGO_SUPERUSER_EMAIL": "deployment-admin@example.com",
+            "DJANGO_SUPERUSER_PASSWORD": "UnitTest-Only!9427",
+        }
+        output = StringIO()
+
+        with patch.dict(os.environ, environment, clear=False):
+            call_command("provision_admin", stdout=output)
+            call_command("provision_admin", stdout=output)
+
+        user = get_user_model().objects.get(username=environment["DJANGO_SUPERUSER_USERNAME"])
+        self.assertEqual(get_user_model().objects.count(), 1)
+        self.assertTrue(user.is_staff)
+        self.assertTrue(user.is_superuser)
+        self.assertTrue(user.check_password(environment["DJANGO_SUPERUSER_PASSWORD"]))
+        self.assertNotIn(environment["DJANGO_SUPERUSER_PASSWORD"], output.getvalue())
+
+    def test_rejects_partial_environment_configuration(self):
+        environment = {
+            "DJANGO_SUPERUSER_USERNAME": "deployment-admin",
+            "DJANGO_SUPERUSER_EMAIL": "",
+            "DJANGO_SUPERUSER_PASSWORD": "",
+        }
+
+        with patch.dict(os.environ, environment, clear=False):
+            with self.assertRaises(CommandError):
+                call_command("provision_admin")
+
+
+class LoginSecurityTests(APITestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="active", email="active@example.com", password=PASSWORD
+        )
+
+    def test_active_user_can_log_in(self):
+        response = self.client.post(
+            reverse("login"), {"email": "active@example.com", "password": PASSWORD}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+        self.assertIn("refresh", response.data)
+
+    def test_jwt_payload_does_not_expose_profile_or_plan(self):
+        response = self.client.post(
+            reverse("login"), {"email": "active@example.com", "password": PASSWORD}, format="json"
+        )
+        refresh = RefreshToken(response.data["refresh"])
+        for token in (refresh, refresh.access_token):
+            for claim in ("email", "username", "plan"):
+                self.assertNotIn(claim, token.payload)
+
+    def test_deactivated_user_cannot_log_in(self):
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+
+        response = self.client.post(
+            reverse("login"), {"email": "active@example.com", "password": PASSWORD}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertNotIn("access", response.data)
+
+    @override_settings(
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        TURNSTILE_SECRET_KEY="test",
+        FRONTEND_ORIGIN="https://agromind.farm",
+        PASSWORD_REGISTRATION_ENABLED=True,
+    )
+    def test_weak_password_is_rejected_on_register(self):
+        with patch("users.registration_security.requests.post") as verify:
+            verify.return_value.json.return_value = {"success": True, "action": "register", "hostname": "agromind.farm"}
+            response = self.client.post(
+                reverse("register"),
+                {"email": "weak@example.com", "password": "12345678", "accepted_terms": True, "turnstile_token": "test-token"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(get_user_model().objects.filter(email="weak@example.com").exists())
+
+
+class TokenRefreshTests(APITestCase):
+    """A session must survive past the 30-minute access-token lifetime."""
+
+    def setUp(self):
+        get_user_model().objects.create_user(
+            username="refresher", email="refresh@example.com", password=PASSWORD
+        )
+        login = self.client.post(
+            reverse("login"), {"email": "refresh@example.com", "password": PASSWORD}, format="json"
+        )
+        self.refresh = login.data["refresh"]
+
+    def test_refresh_returns_a_new_access_token(self):
+        response = self.client.post(reverse("token-refresh"), {"refresh": self.refresh}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+
+    def test_rotated_refresh_token_cannot_be_replayed(self):
+        first = self.client.post(reverse("token-refresh"), {"refresh": self.refresh}, format="json")
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertIn("refresh", first.data)
+
+        replay = self.client.post(reverse("token-refresh"), {"refresh": self.refresh}, format="json")
+        self.assertEqual(replay.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_garbage_refresh_token_is_rejected(self):
+        response = self.client.post(reverse("token-refresh"), {"refresh": "not-a-token"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_expired_access_token_401s_and_the_refreshed_one_works(self):
+        """The contract the browser's retry-on-401 depends on: an expired access
+        token must answer 401 (not 403), and the refreshed one must be accepted."""
+        access = RefreshToken(self.refresh).access_token
+        access.set_exp(from_time=timezone.now() - timedelta(hours=2), lifetime=timedelta(seconds=1))
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        self.assertEqual(self.client.get(reverse("me")).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        refreshed = self.client.post(reverse("token-refresh"), {"refresh": self.refresh}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {refreshed.data['access']}")
+        self.assertEqual(self.client.get(reverse("me")).status_code, status.HTTP_200_OK)
+
+
+class EmailUniquenessTests(TestCase):
+    """Email is the login identifier, so the database must reject duplicates."""
+
+    def test_duplicate_email_is_rejected_case_insensitively(self):
+        get_user_model().objects.create_user(username="first", email="owner@example.com", password=PASSWORD)
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                get_user_model().objects.create_user(
+                    username="second", email="OWNER@example.com", password=PASSWORD
+                )
+
+    def test_blank_emails_do_not_collide(self):
+        # Accounts created without an email must still be allowed side by side.
+        get_user_model().objects.create_user(username="noemail1", email="", password=PASSWORD)
+        get_user_model().objects.create_user(username="noemail2", email="", password=PASSWORD)
+
+        self.assertEqual(get_user_model().objects.filter(email="").count(), 2)
+
+
+@override_settings(
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+    TURNSTILE_SECRET_KEY="unit-test-secret",
+    FRONTEND_ORIGIN="https://agromind.farm",
+    PASSWORD_REGISTRATION_ENABLED=True,
+)
+class RegistrationConsentTests(APITestCase):
+    """Consent used to be a browser-only checkbox with no server-side record."""
+
+    def setUp(self):
+        verifier_patcher = patch("users.registration_security.requests.post")
+        self.mock_verify = verifier_patcher.start()
+        self.addCleanup(verifier_patcher.stop)
+        self.mock_verify.return_value.json.return_value = {
+            "success": True,
+            "action": "register",
+            "hostname": "agromind.farm",
+        }
+
+    def payload(self, email="consented@example.com"):
+        return {"email": email, "password": PASSWORD, "accepted_terms": True, "turnstile_token": "test-token"}
+
+    def test_registration_requires_and_records_consent(self):
+        response = self.client.post(
+            reverse("register"),
+            self.payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        user = get_user_model().objects.get(email="consented@example.com")
+        self.assertIsNotNone(user.terms_accepted_at)
+        self.assertEqual(user.terms_version, TERMS_VERSION)
+        self.assertFalse(user.is_active)
+        self.assertIsNone(user.email_verified_at)
+        self.assertNotIn("access", response.data)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("/verify-email?token=", mail.outbox[0].body)
+
+    def test_registration_without_consent_is_rejected(self):
+        for payload in (
+            {"email": "nope@example.com", "password": PASSWORD, "accepted_terms": False, "turnstile_token": "test-token"},
+            {"email": "nope@example.com", "password": PASSWORD, "turnstile_token": "test-token"},
+        ):
+            response = self.client.post(reverse("register"), payload, format="json")
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("accepted_terms", response.data)
+
+        self.assertFalse(get_user_model().objects.filter(email="nope@example.com").exists())
+
+    def test_registration_requires_email_verification_before_login_and_quota(self):
+        response = self.client.post(
+            reverse("register"),
+            self.payload("atomic@example.com"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        login = self.client.post(reverse("login"), {"email": "atomic@example.com", "password": PASSWORD}, format="json")
+        self.assertEqual(login.status_code, 400)
+        self.assertIn("xác minh", str(login.data))
+        token = EmailVerificationToken.objects.get(user__email="atomic@example.com")
+        raw = mail.outbox[0].body.split("token=", 1)[1].split()[0]
+        self.assertNotEqual(raw, token.token_hash)
+        confirmed = self.client.post(reverse("verify-email"), {"token": raw}, format="json")
+        self.assertEqual(confirmed.status_code, 200)
+        self.assertEqual(self.client.post(reverse("verify-email"), {"token": raw}, format="json").status_code, 400)
+        self.assertTrue(get_user_model().objects.get(email="atomic@example.com").is_active)
+        self.assertEqual(self.client.post(reverse("login"), {"email": "atomic@example.com", "password": PASSWORD}, format="json").status_code, 200)
+
+    def test_missing_or_invalid_turnstile_never_creates_user(self):
+        for token in ("", "invalid"):
+            if token:
+                self.mock_verify.return_value.json.return_value = {"success": False, "error-codes": ["invalid-input-response"]}
+            response = self.client.post(reverse("register"), {**self.payload("blocked@example.com"), "turnstile_token": token}, format="json")
+            self.assertEqual(response.status_code, 400)
+        self.assertFalse(get_user_model().objects.filter(email="blocked@example.com").exists())
+
+    def test_turnstile_hostname_and_action_must_match(self):
+        for invalid in (
+            {"success": True, "action": "login", "hostname": "agromind.farm"},
+            {"success": True, "action": "register", "hostname": "other.example"},
+        ):
+            self.mock_verify.return_value.json.return_value = invalid
+            response = self.client.post(reverse("register"), self.payload(), format="json")
+            self.assertEqual(response.status_code, 400)
+        self.assertFalse(get_user_model().objects.filter(email="consented@example.com").exists())
+
+    def test_email_send_failure_rolls_back_pending_account(self):
+        with patch("users.views.send_verification_email", return_value=False):
+            response = self.client.post(reverse("register"), self.payload(), format="json")
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(get_user_model().objects.filter(email="consented@example.com").exists())
+        self.assertEqual(EmailVerificationToken.objects.count(), 0)
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.console.EmailBackend")
+    def test_registration_without_real_email_delivery_fails_closed(self):
+        response = self.client.post(reverse("register"), self.payload(), format="json")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(get_user_model().objects.count(), 0)
+
+    def test_pending_user_cannot_use_a_manually_minted_jwt(self):
+        self.client.post(reverse("register"), self.payload(), format="json")
+        user = get_user_model().objects.get(email="consented@example.com")
+        refresh = RefreshToken.for_user(user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {refresh.access_token}")
+        self.assertEqual(self.client.get(reverse("me")).status_code, 401)
+        self.client.credentials()
+        self.assertEqual(self.client.post(reverse("token-refresh"), {"refresh": str(refresh)}, format="json").status_code, 401)
+
+    def test_unconfigured_turnstile_fails_closed(self):
+        with override_settings(TURNSTILE_SECRET_KEY=""):
+            response = self.client.post(reverse("register"), self.payload(), format="json")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(get_user_model().objects.count(), 0)
+
+    def test_repeated_email_pattern_is_blocked_and_logged(self):
+        for index in range(5):
+            response = self.client.post(reverse("register"), self.payload(f"bot_{index}@example.com"), format="json")
+            self.assertEqual(response.status_code, 201)
+        response = self.client.post(reverse("register"), self.payload("bot_999@example.com"), format="json")
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(RegistrationAttempt.objects.filter(outcome="blocked").count(), 1)
+        self.assertFalse(get_user_model().objects.filter(email="bot_999@example.com").exists())
+
+    @override_settings(REGISTRATION_IP_HOURLY_LIMIT=0)
+    def test_ip_limit_can_be_delegated_to_cloudflare(self):
+        response = self.client.post(reverse("register"), self.payload("edge-user@example.com"), format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(RegistrationAttempt.objects.filter(outcome="blocked").exists())
+
+    @override_settings(REGISTRATION_ALERT_EMAIL="security@example.com")
+    def test_abuse_threshold_sends_one_alert(self):
+        for index in range(5):
+            self.client.post(reverse("register"), self.payload(f"robot_{index}@example.com"), format="json")
+        self.assertEqual(self.client.post(reverse("register"), self.payload("robot_9@example.com"), format="json").status_code, 429)
+        self.assertEqual(self.client.post(reverse("register"), self.payload("robot_10@example.com"), format="json").status_code, 429)
+        alerts = [message for message in mail.outbox if message.to == ["security@example.com"]]
+        self.assertEqual(len(alerts), 1)
+        self.assertNotIn("robot_", alerts[0].body)
+
+    def test_expired_token_can_be_resent_after_new_challenge(self):
+        self.client.post(reverse("register"), self.payload(), format="json")
+        old = EmailVerificationToken.objects.get(user__email="consented@example.com")
+        old.expires_at = timezone.now() - timedelta(seconds=1)
+        old.save(update_fields=["expires_at"])
+        old_raw = mail.outbox[0].body.split("token=", 1)[1].split()[0]
+        self.assertEqual(self.client.post(reverse("verify-email"), {"token": old_raw}, format="json").status_code, 400)
+        resent = self.client.post(reverse("verify-email-resend"), {"email": "consented@example.com", "turnstile_token": "fresh"}, format="json")
+        self.assertEqual(resent.status_code, 200)
+        self.assertEqual(len(mail.outbox), 2)
+
+
+class PasswordRegistrationDisabledTests(APITestCase):
+    def test_new_password_accounts_are_not_created(self):
+        response = self.client.post(reverse("register"), {"email": "new@example.com"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_410_GONE)
+        self.assertFalse(get_user_model().objects.filter(email="new@example.com").exists())
+
+    def test_resend_is_not_offered_without_password_registration(self):
+        response = self.client.post(reverse("verify-email-resend"), {"email": "new@example.com"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_410_GONE)
+
+
+@override_settings(TURNSTILE_SECRET_KEY="unit-test-secret", FRONTEND_ORIGIN="https://agromind.farm")
+class GoogleConsentTests(APITestCase):
+    """The Google button used to skip the consent checkbox entirely."""
+
+    def setUp(self):
+        cache.clear()
+        verifier_patcher = patch("users.registration_security.requests.post")
+        verifier = verifier_patcher.start()
+        self.addCleanup(verifier_patcher.stop)
+        verifier.return_value.json.return_value = {"success": True, "action": "register", "hostname": "agromind.farm"}
+
+    @override_settings(GOOGLE_CLIENT_ID="test-client-id")
+    @patch("users.serializers.id_token.verify_oauth2_token")
+    def test_first_google_sign_in_requires_and_records_consent(self, verify):
+        verify.return_value = {
+            "email": "google-new@example.com",
+            "email_verified": True,
+            "name": "Google User",
+        }
+
+        refused = self.client.post(reverse("google-login"), {"credential": "x"}, format="json")
+        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("accepted_terms", refused.data)
+        self.assertFalse(get_user_model().objects.filter(email="google-new@example.com").exists())
+
+        accepted = self.client.post(
+            reverse("google-login"), {"credential": "x", "accepted_terms": True, "turnstile_token": "test-token"}, format="json"
+        )
+        self.assertEqual(accepted.status_code, status.HTTP_200_OK)
+        user = get_user_model().objects.get(email="google-new@example.com")
+        self.assertIsNotNone(user.terms_accepted_at)
+        self.assertEqual(user.terms_version, TERMS_VERSION)
+
+    @override_settings(GOOGLE_CLIENT_ID="")
+    def test_readiness_probe_reports_an_unconfigured_server(self):
+        response = self.client.get(reverse("google-login"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["configured"])
+
+    @override_settings(GOOGLE_CLIENT_ID="test-client-id")
+    def test_readiness_probe_reports_a_configured_server(self):
+        self.assertTrue(self.client.get(reverse("google-login")).data["configured"])
+
+    @override_settings(GOOGLE_CLIENT_ID="test-client-id")
+    @patch("users.serializers.id_token.verify_oauth2_token")
+    def test_existing_account_signs_in_without_re_consenting(self, verify):
+        get_user_model().objects.create_user(
+            username="googler", email="google-old@example.com", password=PASSWORD
+        )
+        verify.return_value = {
+            "email": "google-old@example.com",
+            "email_verified": True,
+            "name": "Google User",
+        }
+
+        response = self.client.post(reverse("google-login"), {"credential": "x"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @override_settings(GOOGLE_CLIENT_ID="test-client-id")
+    @patch("users.serializers.id_token.verify_oauth2_token")
+    def test_google_token_verification_is_rate_limited(self, verify):
+        verify.return_value = {
+            "email": "rate-google@example.com",
+            "email_verified": True,
+            "name": "Google User",
+        }
+        payload = {"credential": "x", "accepted_terms": True, "turnstile_token": "test-token"}
+
+        for _ in range(20):
+            self.assertEqual(
+                self.client.post(reverse("google-login"), payload, format="json").status_code,
+                status.HTTP_200_OK,
+            )
+
+        blocked = self.client.post(reverse("google-login"), payload, format="json")
+        self.assertEqual(blocked.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+class LogoutTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        get_user_model().objects.create_user(
+            username="leaver", email="leaver@example.com", password=PASSWORD
+        )
+        login = self.client.post(
+            reverse("login"), {"email": "leaver@example.com", "password": PASSWORD}, format="json"
+        )
+        self.refresh = login.data["refresh"]
+
+    def test_logout_blacklists_the_refresh_token(self):
+        response = self.client.post(reverse("logout"), {"refresh": self.refresh}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        replay = self.client.post(reverse("token-refresh"), {"refresh": self.refresh}, format="json")
+        self.assertEqual(replay.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_logout_rejects_a_garbage_token(self):
+        response = self.client.post(reverse("logout"), {"refresh": "not-a-token"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend", EMAIL_HOST="mail.test")
+class PasswordResetTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="forgetful", email="forgetful@example.com", password=PASSWORD
+        )
+
+    def request_reset(self, email="forgetful@example.com"):
+        return self.client.post(reverse("password-reset"), {"email": email}, format="json")
+
+    def token_from_last_email(self):
+        return mail.outbox[-1].body.split("reset-password?token=")[1].split()[0]
+
+    def test_request_emails_a_working_token(self):
+        response = self.request_reset()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(mail.outbox), 1)
+
+        confirm = self.client.post(
+            reverse("password-reset-confirm"),
+            {"token": self.token_from_last_email(), "new_password": NEW_PASSWORD},
+            format="json",
+        )
+        self.assertEqual(confirm.status_code, status.HTTP_200_OK)
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(NEW_PASSWORD))
+
+    def test_unknown_address_gets_the_same_answer_and_no_email(self):
+        known = self.request_reset()
+        unknown = self.request_reset("stranger@example.com")
+
+        self.assertEqual(known.status_code, unknown.status_code)
+        self.assertEqual(known.data["detail"], unknown.data["detail"])
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_token_cannot_be_reused(self):
+        self.request_reset()
+        token = self.token_from_last_email()
+        payload = {"token": token, "new_password": NEW_PASSWORD}
+
+        self.assertEqual(
+            self.client.post(reverse("password-reset-confirm"), payload, format="json").status_code,
+            status.HTTP_200_OK,
+        )
+        replay = self.client.post(reverse("password-reset-confirm"), payload, format="json")
+        self.assertEqual(replay.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_expired_token_is_rejected(self):
+        self.request_reset()
+        token_row = PasswordResetToken.objects.get(user=self.user)
+        token_row.expires_at = timezone.now() - timedelta(minutes=1)
+        token_row.save(update_fields=["expires_at"])
+
+        response = self.client.post(
+            reverse("password-reset-confirm"),
+            {"token": self.token_from_last_email(), "new_password": NEW_PASSWORD},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(PASSWORD))
+
+    def test_requesting_again_invalidates_the_previous_link(self):
+        self.request_reset()
+        first_token = self.token_from_last_email()
+        self.request_reset()
+
+        response = self.client.post(
+            reverse("password-reset-confirm"),
+            {"token": first_token, "new_password": NEW_PASSWORD},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_raw_token_is_never_stored(self):
+        self.request_reset()
+        token = self.token_from_last_email()
+        self.assertFalse(PasswordResetToken.objects.filter(token_hash=token).exists())
+        self.assertTrue(
+            PasswordResetToken.objects.filter(token_hash=PasswordResetToken.hash_token(token)).exists()
+        )
+
+    def test_reset_ends_sessions_opened_with_the_old_password(self):
+        stolen = self.client.post(
+            reverse("login"), {"email": "forgetful@example.com", "password": PASSWORD}, format="json"
+        ).data["refresh"]
+
+        self.request_reset()
+        self.client.post(
+            reverse("password-reset-confirm"),
+            {"token": self.token_from_last_email(), "new_password": NEW_PASSWORD},
+            format="json",
+        )
+
+        replay = self.client.post(reverse("token-refresh"), {"refresh": stolen}, format="json")
+        self.assertEqual(replay.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_weak_new_password_is_rejected(self):
+        self.request_reset()
+        response = self.client.post(
+            reverse("password-reset-confirm"),
+            {"token": self.token_from_last_email(), "new_password": "12345678"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.dummy.EmailBackend")
+class PasswordResetWithoutSmtpTests(APITestCase):
+    """Without a mail provider, never issue a reset token or log its link."""
+
+    def setUp(self):
+        cache.clear()
+        get_user_model().objects.create_user(
+            username="offline", email="offline@example.com", password=PASSWORD
+        )
+
+    def test_request_reports_unavailable_and_does_not_issue_a_token(self):
+        response = self.client.post(
+            reverse("password-reset"), {"email": "offline@example.com"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["delivery_enabled"])
+        self.assertEqual(PasswordResetToken.objects.filter(used_at__isnull=True).count(), 0)
+
+
+class PasswordChangeTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="changer", email="changer@example.com", password=PASSWORD
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_correct_current_password_changes_it(self):
+        response = self.client.post(
+            reverse("change-password"),
+            {"current_password": PASSWORD, "new_password": NEW_PASSWORD},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(NEW_PASSWORD))
+
+    def test_wrong_current_password_is_rejected(self):
+        response = self.client.post(
+            reverse("change-password"),
+            {"current_password": "wrong-one", "new_password": NEW_PASSWORD},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(PASSWORD))
+
+    def test_google_only_account_can_set_a_first_password(self):
+        google_user = get_user_model().objects.create(username="googler", email="googler@example.com")
+        google_user.set_unusable_password()
+        google_user.save()
+        self.client.force_authenticate(google_user)
+
+        response = self.client.post(
+            reverse("change-password"), {"new_password": NEW_PASSWORD}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        google_user.refresh_from_db()
+        self.assertTrue(google_user.check_password(NEW_PASSWORD))
+
+    def test_anonymous_caller_is_refused(self):
+        self.client.force_authenticate(None)
+        response = self.client.post(
+            reverse("change-password"),
+            {"current_password": PASSWORD, "new_password": NEW_PASSWORD},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class AccountDeletionTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="quitter", email="quitter@example.com", password=PASSWORD
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_deletion_needs_the_password_and_the_confirm_phrase(self):
+        for payload in (
+            {"password": PASSWORD, "confirm_text": "xoa"},
+            {"password": "wrong-one", "confirm_text": "XÓA TÀI KHOẢN"},
+            {"confirm_text": "XÓA TÀI KHOẢN"},
+        ):
+            response = self.client.delete(reverse("me"), payload, format="json")
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.assertTrue(get_user_model().objects.filter(pk=self.user.pk).exists())
+
+    def test_confirmed_deletion_removes_the_account(self):
+        response = self.client.delete(
+            reverse("me"), {"password": PASSWORD, "confirm_text": "XÓA TÀI KHOẢN"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(get_user_model().objects.filter(pk=self.user.pk).exists())
+
+    def test_preview_lists_what_would_be_destroyed(self):
+        response = self.client.get(reverse("account-deletion-preview"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["diagnoses"], 0)
+        self.assertIn("farm_plots", response.data)
+        self.assertIn("crop_plans", response.data)
+
+
+class ProfileFieldTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="farmer", email="farmer@example.com", password=PASSWORD
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_me_exposes_plan_expiry_and_consent(self):
+        self.user.plan_expires_at = timezone.now() + timedelta(days=30)
+        self.user.record_terms_consent()
+        self.user.save()
+
+        response = self.client.get(reverse("me"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data["plan_expires_at"])
+        self.assertEqual(response.data["terms_version"], TERMS_VERSION)
+        self.assertTrue(response.data["has_usable_password"])
+
+    def test_every_editable_field_round_trips(self):
+        payload = {
+            "full_name": "Nông dân A",
+            "phone": "0900111222",
+            "company_name": "HTX A",
+            "farm_name": "Vườn A",
+            "location": "Đà Lạt",
+            "avatar_url": "https://example.com/a.png",
+        }
+        response = self.client.patch(reverse("me"), payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for key, value in payload.items():
+            self.assertEqual(response.data[key], value)
+
+    def test_avatar_can_be_cleared(self):
+        self.user.avatar_url = "https://example.com/a.png"
+        self.user.save(update_fields=["avatar_url"])
+
+        response = self.client.patch(reverse("me"), {"avatar_url": ""}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["avatar_url"], "")
+
+    def test_email_is_normalised_and_cannot_be_blanked_or_stolen(self):
+        get_user_model().objects.create_user(
+            username="other", email="other@example.com", password=PASSWORD
+        )
+
+        self.assertEqual(
+            self.client.patch(reverse("me"), {"email": ""}, format="json").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(
+            self.client.patch(reverse("me"), {"email": "OTHER@example.com"}, format="json").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        mixed_case = self.client.patch(reverse("me"), {"email": "Farmer@Example.com"}, format="json")
+        self.assertEqual(mixed_case.status_code, status.HTTP_200_OK)
+        self.assertEqual(mixed_case.data["email"], "farmer@example.com")
+
+
+class UserSettingTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="settler", email="settler@example.com", password=PASSWORD
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_settings_are_created_on_first_read_and_can_be_patched(self):
+        first = self.client.get(reverse("settings"))
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertTrue(first.data["email_notifications"])
+
+        patched = self.client.patch(
+            reverse("settings"),
+            {"email_notifications": False, "timezone": "Asia/Bangkok", "language": "en"},
+            format="json",
+        )
+
+        self.assertEqual(patched.status_code, status.HTTP_200_OK)
+        self.assertFalse(patched.data["email_notifications"])
+        self.assertEqual(patched.data["timezone"], "Asia/Bangkok")
+        self.assertEqual(patched.data["language"], "en")
+
+
+class LoginThrottleTests(APITestCase):
+    """A shared IP must not lock unrelated growers out of their own accounts."""
+
+    def setUp(self):
+        cache.clear()
+        for name in ("victim", "bystander"):
+            get_user_model().objects.create_user(
+                username=name, email=f"{name}@example.com", password=PASSWORD
+            )
+
+    def test_hammering_one_account_does_not_lock_out_another(self):
+        for _ in range(12):
+            self.client.post(
+                reverse("login"), {"email": "victim@example.com", "password": "wrong"}, format="json"
+            )
+
+        blocked = self.client.post(
+            reverse("login"), {"email": "victim@example.com", "password": PASSWORD}, format="json"
+        )
+        self.assertEqual(blocked.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        allowed = self.client.post(
+            reverse("login"), {"email": "bystander@example.com", "password": PASSWORD}, format="json"
+        )
+        self.assertEqual(allowed.status_code, status.HTTP_200_OK)
+
+
+@override_settings(
+    EMAIL_BACKEND="core.mail.BrevoAPIBackend",
+    BREVO_API_KEY="test-key",
+    DEFAULT_FROM_EMAIL="Agromind AI <no-reply@agromindai.example>",
+)
+class BrevoMailBackendTests(APITestCase):
+    """Render blocks outbound SMTP, so delivery goes over HTTPS instead. These
+    cover the shape Brevo expects and the failure paths, without a network call."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="brevo", email="brevo@example.com", password=PASSWORD
+        )
+
+    def test_password_reset_posts_the_expected_payload(self):
+        captured = {}
+
+        class Response:
+            status_code = 201
+
+            def raise_for_status(self):
+                return None
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured.update(url=url, body=json, headers=headers, timeout=timeout)
+            return Response()
+
+        with patch("core.mail.requests.post", fake_post):
+            response = self.client.post(
+                reverse("password-reset"), {"email": self.user.email}, format="json"
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(captured["url"], "https://api.brevo.com/v3/smtp/email")
+        self.assertEqual(captured["headers"]["api-key"], "test-key")
+        # A stalled provider must not pin the single free-tier worker.
+        self.assertEqual(captured["timeout"], django_settings.EMAIL_TIMEOUT)
+        body = captured["body"]
+        self.assertEqual(body["sender"], {"email": "no-reply@agromindai.example", "name": "Agromind AI"})
+        self.assertEqual(body["to"], [{"email": self.user.email}])
+        self.assertIn("reset-password?token=", body["textContent"])
+
+    def test_provider_failure_never_reaches_the_caller(self):
+        """The endpoint must answer identically whether or not delivery worked,
+        or the response time alone would reveal which addresses have accounts."""
+        with patch("core.mail.requests.post", side_effect=RuntimeError("provider down")):
+            response = self.client.post(
+                reverse("password-reset"), {"email": self.user.email}, format="json"
+            )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # The token is still issued, so a retry once the provider recovers works.
+        self.assertTrue(PasswordResetToken.objects.filter(user=self.user).exists())
+
+    def test_missing_api_key_is_reported_not_swallowed(self):
+        from core.mail import BrevoAPIBackend
+
+        with override_settings(BREVO_API_KEY=""):
+            backend = BrevoAPIBackend()
+            message = mail.EmailMessage(subject="x", body="y", to=["a@example.com"])
+            with self.assertRaises(ValueError):
+                backend.send_messages([message])
+
+
+class PasswordResetDeliveryGateTests(APITestCase):
+    """Without a mail provider the link only reaches the server log, so the
+    endpoint must say the feature is off rather than promise an email."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="gate", email="gate@example.com", password=PASSWORD
+        )
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.console.EmailBackend")
+    def test_unconfigured_delivery_is_declared_and_issues_no_token(self):
+        response = self.client.post(
+            reverse("password-reset"), {"email": self.user.email}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["delivery_enabled"])
+        self.assertIn("chưa được bật", response.data["detail"])
+        # Issuing one would spend the throttle and invalidate any live token
+        # for a link nobody can receive.
+        self.assertFalse(PasswordResetToken.objects.filter(user=self.user).exists())
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+    def test_configured_delivery_behaves_as_before(self):
+        response = self.client.post(
+            reverse("password-reset"), {"email": self.user.email}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["delivery_enabled"])
+        self.assertTrue(PasswordResetToken.objects.filter(user=self.user).exists())
+        self.assertEqual(len(mail.outbox), 1)
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.console.EmailBackend")
+    def test_answer_does_not_depend_on_whether_the_account_exists(self):
+        """The unavailable answer must stay uniform, or it becomes the account
+        enumeration oracle the original design set out to avoid."""
+        known = self.client.post(
+            reverse("password-reset"), {"email": self.user.email}, format="json"
+        )
+        unknown = self.client.post(
+            reverse("password-reset"), {"email": "nobody@example.com"}, format="json"
+        )
+        self.assertEqual(known.data, unknown.data)
+
+
+class WebSessionTests(APITestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="opaque", email="opaque@example.com", password=PASSWORD,
+        )
+
+    def exchange(self):
+        jwt_refresh = RefreshToken.for_user(self.user)
+        response = self.client.post(
+            reverse("web-session-exchange"),
+            {"refresh": str(jwt_refresh)},
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {jwt_refresh.access_token}",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data, str(jwt_refresh)
+
+    def test_tokens_are_opaque_hashed_and_rotate_once(self):
+        pair, jwt_refresh = self.exchange()
+        self.assertNotIn(".", pair["access"])
+        self.assertEqual(len(pair["refresh"]), 43)
+        session = WebSession.objects.get(user=self.user)
+        self.assertNotEqual(session.access_hash, pair["access"])
+        self.assertNotEqual(session.refresh_hash, pair["refresh"])
+        self.assertEqual(
+            self.client.post(reverse("token-refresh"), {"refresh": jwt_refresh}, format="json").status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+        me = self.client.get(reverse("me"), HTTP_AUTHORIZATION=f"Session {pair['access']}")
+        self.assertEqual(me.status_code, status.HTTP_200_OK)
+
+        rotated = self.client.post(reverse("web-session-refresh"), {"refresh": pair["refresh"]}, format="json")
+        self.assertEqual(rotated.status_code, status.HTTP_200_OK)
+        self.assertNotEqual(rotated.data["access"], pair["access"])
+        self.assertEqual(
+            self.client.get(reverse("me"), HTTP_AUTHORIZATION=f"Session {pair['access']}").status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+        self.assertEqual(
+            self.client.post(reverse("web-session-refresh"), {"refresh": pair["refresh"]}, format="json").status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+        self.assertEqual(
+            self.client.post(reverse("web-session-logout"), {"refresh": rotated.data["refresh"]}, format="json").status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.get(reverse("me"), HTTP_AUTHORIZATION=f"Session {rotated.data['access']}").status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+    def test_exchange_requires_matching_refresh_owner(self):
+        other = get_user_model().objects.create_user(
+            username="other", email="other@example.com", password=PASSWORD,
+        )
+        own_access = RefreshToken.for_user(self.user).access_token
+        other_refresh = RefreshToken.for_user(other)
+        response = self.client.post(
+            reverse("web-session-exchange"), {"refresh": str(other_refresh)}, format="json",
+            HTTP_AUTHORIZATION=f"Bearer {own_access}",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertFalse(WebSession.objects.exists())
+
+    def test_jwt_pair_cannot_be_exchanged_twice(self):
+        refresh = RefreshToken.for_user(self.user)
+        access = str(refresh.access_token)
+        first = self.client.post(
+            reverse("web-session-exchange"), {"refresh": str(refresh)}, format="json",
+            HTTP_AUTHORIZATION=f"Bearer {access}",
+        )
+        second = self.client.post(
+            reverse("web-session-exchange"), {"refresh": str(refresh)}, format="json",
+            HTTP_AUTHORIZATION=f"Bearer {access}",
+        )
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(WebSession.objects.count(), 1)
+
+    def test_revocation_and_inactive_user(self):
+        from .serializers import revoke_all_refresh_tokens
+
+        pair, _ = self.exchange()
+        revoke_all_refresh_tokens(self.user)
+        self.assertEqual(
+            self.client.get(reverse("me"), HTTP_AUTHORIZATION=f"Session {pair['access']}").status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+        pair, _ = self.exchange()
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        self.assertEqual(
+            self.client.post(reverse("web-session-refresh"), {"refresh": pair["refresh"]}, format="json").status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )

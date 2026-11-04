@@ -1,0 +1,574 @@
+@import "../styles/tokens.css";
+@import "leaflet/dist/leaflet.css";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-be-vietnam: "Be Vietnam Pro", "Segoe UI", system-ui, sans-serif;
+  }
+
+  html {
+    position: relative;
+    scroll-behavior: smooth;
+  }
+
+body {
+    min-height: 100dvh;
+    background-color: var(--canvas);
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.6;
+    font-feature-settings: "kern" 1, "liga" 1;
+    transition: background-color 180ms ease-out, color 180ms ease-out;
+}
+
+  button,
+  a,
+  input,
+  textarea,
+  select {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+@layer utilities {
+  .text-display {
+    font-size: 44px;
+    line-height: 1.1;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+
+  .text-h1 {
+    font-size: 32px;
+    line-height: 1.2;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+
+  .text-h2 {
+    font-size: 24px;
+    line-height: 1.3;
+    font-weight: 600;
+  }
+
+  .text-h3 {
+    font-size: 18px;
+    line-height: 1.4;
+    font-weight: 600;
+  }
+
+  .text-body-lg {
+    font-size: 16px;
+    line-height: 1.6;
+    font-weight: 400;
+  }
+
+  .text-body {
+    font-size: 14px;
+    line-height: 1.55;
+    font-weight: 400;
+  }
+
+  .text-body-sm {
+    font-size: 13px;
+    line-height: 1.5;
+    font-weight: 400;
+  }
+
+  .text-caption {
+    font-size: 12px;
+    line-height: 1.4;
+    font-weight: 500;
+  }
+
+  .text-overline {
+    font-size: 11px;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+}
+
+::selection {
+  background: rgba(47, 125, 50, 0.22);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--canvas) 88%, var(--ink) 12%);
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  border: 2px solid var(--canvas);
+  background: color-mix(in srgb, var(--leaf) 54%, transparent);
+}
+
+.section-grid {
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--line) 44%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--line) 44%, transparent) 1px, transparent 1px);
+  background-size: 34px 34px;
+}
+
+.field-contours {
+  background-image:
+    radial-gradient(ellipse at 12% 15%, color-mix(in srgb, var(--mint) 46%, transparent), transparent 34%),
+    radial-gradient(ellipse at 88% 8%, color-mix(in srgb, var(--sun) 16%, transparent), transparent 28%),
+    repeating-radial-gradient(ellipse at 82% 18%, transparent 0 30px, color-mix(in srgb, var(--line) 35%, transparent) 31px 32px);
+}
+
+.living-veins {
+  background-image:
+    linear-gradient(112deg, transparent 0 46%, color-mix(in srgb, var(--leaf) 18%, transparent) 46.2% 46.6%, transparent 46.8%),
+    linear-gradient(28deg, transparent 0 52%, color-mix(in srgb, var(--line-strong) 28%, transparent) 52.2% 52.5%, transparent 52.7%),
+    radial-gradient(ellipse at 14% 18%, color-mix(in srgb, var(--mint) 38%, transparent), transparent 42%);
+}
+
+.chlorophyll-button {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+
+.chlorophyll-button::before {
+  position: absolute;
+  inset: -1px;
+  z-index: -1;
+  content: "";
+  background: radial-gradient(circle at var(--button-x, 50%) var(--button-y, 50%), color-mix(in srgb, var(--mint) 42%, transparent), transparent 38%);
+  opacity: 0;
+  transition: opacity var(--d-base) var(--ease-out);
+}
+
+.chlorophyll-button:hover::before,
+.chlorophyll-button:focus-visible::before {
+  opacity: 1;
+}
+
+.vein-divider {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--line-strong) 18%, var(--leaf) 50%, var(--line-strong) 82%, transparent);
+}
+
+.text-gradient {
+  background: linear-gradient(120deg, var(--forest) 0%, var(--leaf-strong) 52%, var(--leaf) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  border-radius: var(--r-lg);
+  z-index: 0;
+}
+
+/* ── Motion system: Field Lens ── */
+
+@keyframes fl-shimmer {
+  0% { background-position: -160% 0; }
+  100% { background-position: 260% 0; }
+}
+
+@keyframes fl-rise-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fl-pulse-ring {
+  0% { box-shadow: 0 0 0 0 var(--ring-leaf); }
+  70% { box-shadow: 0 0 0 9px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+@keyframes fl-rail-grow-x {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+@keyframes fl-rail-grow-y {
+  from { transform: scaleY(0); }
+  to { transform: scaleY(1); }
+}
+
+@keyframes fl-check-pop {
+  0% { opacity: 0; transform: scale(0.5); }
+  60% { opacity: 1; transform: scale(1.12); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes fl-lens-scan {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(320%); }
+}
+
+@keyframes fl-meter-fill {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+@keyframes fl-leaf-open {
+  from { clip-path: inset(0 100% 0 0); opacity: 0; }
+  to { clip-path: inset(0 0% 0 0); opacity: 1; }
+}
+
+@keyframes fl-leaf-fade {
+  from { opacity: 0; transform: scale(0.88); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes fl-ai-scan {
+  0% { top: 5%; opacity: 0; }
+  10% { opacity: 0.85; }
+  88% { opacity: 0.85; }
+  100% { top: 93%; opacity: 0; }
+}
+
+@keyframes fl-ai-marker-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.55; }
+  50% { transform: scale(1.35); opacity: 1; }
+}
+
+@keyframes fl-sun-drift {
+  0%, 100% { transform: translate(-6%, -4%) scale(1); }
+  50% { transform: translate(6%, 4%) scale(1.12); }
+}
+
+@layer components {
+  .fl-skeleton {
+    position: relative;
+    overflow: hidden;
+    background:
+      linear-gradient(100deg, transparent 32%, color-mix(in srgb, var(--surface-raised) 72%, transparent) 50%, transparent 68%),
+      var(--surface-soft);
+    background-size: 220% 100%, auto;
+    background-repeat: no-repeat;
+    animation: fl-shimmer 1.7s var(--ease-out) infinite;
+  }
+
+  .fl-rise {
+    animation: fl-rise-in 0.55s var(--ease-out) both;
+    animation-delay: calc(var(--fl-i, 0) * 70ms);
+  }
+
+  .fl-stagger > * {
+    animation: fl-rise-in 0.55s var(--ease-out) both;
+  }
+
+  .fl-stagger > *:nth-child(1) { animation-delay: 0ms; }
+  .fl-stagger > *:nth-child(2) { animation-delay: 70ms; }
+  .fl-stagger > *:nth-child(3) { animation-delay: 140ms; }
+  .fl-stagger > *:nth-child(4) { animation-delay: 210ms; }
+  .fl-stagger > *:nth-child(5) { animation-delay: 280ms; }
+  .fl-stagger > *:nth-child(n+6) { animation-delay: 350ms; }
+
+  .fl-pulse {
+    animation: fl-pulse-ring 1.6s var(--ease-out) infinite;
+  }
+
+  .fl-check {
+    animation: fl-check-pop 0.4s var(--ease-spring) both;
+  }
+
+  .fl-rail-x {
+    transform-origin: left center;
+    animation: fl-rail-grow-x 0.6s var(--ease-out) both;
+  }
+
+  .fl-rail-y {
+    transform-origin: center top;
+    animation: fl-rail-grow-y 0.6s var(--ease-out) both;
+  }
+
+  .fl-meter {
+    transform-origin: left center;
+    animation: fl-meter-fill 0.9s var(--ease-out) both;
+    animation-delay: 0.15s;
+  }
+
+  .fl-lens-frame {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+
+  .fl-lens-frame::after {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto;
+    z-index: 1;
+    height: 34%;
+    background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--mint) 32%, transparent) 55%, color-mix(in srgb, var(--leaf) 26%, transparent));
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--d-base) var(--ease-out);
+  }
+
+  .fl-lens-frame[data-scanning="true"]::after {
+    opacity: 1;
+    animation: fl-lens-scan 1.5s linear infinite;
+  }
+
+  /* ── Leaf Field motif (landing) ── */
+  .fl-leaf-open {
+    animation: fl-leaf-open 820ms var(--ease-out) 160ms both;
+  }
+
+  .fl-leaf-fade {
+    animation: fl-leaf-fade 620ms var(--ease-out) 320ms both;
+  }
+
+  .fl-ai-scan {
+    position: absolute;
+    left: 6%;
+    right: 6%;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--mint) 50%, transparent);
+    box-shadow: 0 0 14px 2px color-mix(in srgb, var(--mint) 45%, transparent);
+    animation: fl-ai-scan 6s ease-in-out infinite;
+  }
+
+  .fl-ai-marker {
+    animation: fl-ai-marker-pulse 3.2s ease-in-out infinite;
+  }
+
+  .fl-feat-focus {
+    position: relative;
+  }
+
+  .fl-feat-focus::after {
+    content: "";
+    position: absolute;
+    inset: -6px;
+    border-radius: inherit;
+    border: 1.5px solid color-mix(in srgb, var(--leaf) 55%, transparent);
+    opacity: 0;
+    transform: scale(0.85);
+    transition: opacity 260ms var(--ease-out), transform 260ms var(--ease-out);
+  }
+
+  .group:hover .fl-feat-focus::after,
+  .group:focus-visible .fl-feat-focus::after {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+
+  .fl-feat-stack {
+    transition: box-shadow 260ms var(--ease-out);
+  }
+
+  .group:hover .fl-feat-stack,
+  .group:focus-visible .fl-feat-stack {
+    box-shadow:
+      4px 5px 0 -2px color-mix(in srgb, var(--leaf) 22%, transparent),
+      8px 10px 0 -4px color-mix(in srgb, var(--leaf) 12%, transparent);
+  }
+
+  .fl-feat-bubble {
+    position: relative;
+  }
+
+  .fl-feat-bubble::after {
+    content: "";
+    position: absolute;
+    top: -2px;
+    right: -6px;
+    height: 6px;
+    width: 6px;
+    border-radius: 999px;
+    background: var(--leaf);
+    opacity: 0;
+    transform: scale(0.4);
+    transition: opacity 220ms var(--ease-out) 40ms, transform 220ms var(--ease-spring) 40ms;
+  }
+
+  .group:hover .fl-feat-bubble::after,
+  .group:focus-visible .fl-feat-bubble::after {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  .fl-feat-sprout {
+    position: relative;
+  }
+
+  .fl-feat-sprout::after {
+    content: "";
+    position: absolute;
+    bottom: -3px;
+    right: -5px;
+    height: 7px;
+    width: 7px;
+    border-radius: 999px 999px 999px 0;
+    background: color-mix(in srgb, var(--on-leaf) 85%, var(--leaf));
+    opacity: 0;
+    transform: scale(0.5) rotate(-25deg);
+    transition: opacity 240ms var(--ease-out) 60ms, transform 240ms var(--ease-spring) 60ms;
+  }
+
+  .group:hover .fl-feat-sprout::after,
+  .group:focus-visible .fl-feat-sprout::after {
+    opacity: 1;
+    transform: scale(1) rotate(0deg);
+  }
+
+  .fl-feat-sun-layer {
+    position: absolute;
+    inset: -40%;
+    pointer-events: none;
+    opacity: 0.5;
+    background: radial-gradient(circle at 30% 30%, color-mix(in srgb, var(--sun) 55%, transparent), transparent 60%);
+    animation: fl-sun-drift 14s ease-in-out infinite;
+  }
+
+  .fl-feat-contour {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 320ms var(--ease-out);
+  }
+
+  .group:hover .fl-feat-contour,
+  .group:focus-visible .fl-feat-contour {
+    opacity: 1;
+  }
+
+  .fl-plant-vein {
+    position: absolute;
+    opacity: 0;
+    transition: opacity 260ms var(--ease-out);
+  }
+
+  .group:hover .fl-plant-vein,
+  .group:focus-visible .fl-plant-vein {
+    opacity: 1;
+  }
+
+  /* ── Eyebrow per the DIEPTEK sheet: 12.5px caps, .12em, lime dash 24x2 ── */
+  .kicker {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--leaf);
+  }
+
+  .kicker::before {
+    content: "";
+    width: 24px;
+    height: 2px;
+    flex: none;
+    background: var(--accent);
+  }
+
+  .paper-grain {
+    position: relative;
+  }
+
+  .paper-grain::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    border-radius: inherit;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+    pointer-events: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .workspace-header,
+  [class*="backdrop-blur"] {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}
+
+@layer base {
+  a,
+  a:hover,
+  a:visited,
+  a:focus {
+    text-decoration: none;
+  }
+
+  /* Triệt để loại bỏ underline khỏi badge/chip trong link */
+  a .badge, a:hover .badge,
+  a [class*="badge"], a:hover [class*="badge"],
+  a [class*="chip"], a:hover [class*="chip"],
+  a [class*="tag"], a:hover [class*="tag"],
+  a span[class*="rounded-full"], a:hover span[class*="rounded-full"] {
+    text-decoration: none !important;
+  }
+}
+
+@layer components {
+  .team-roster-scroll {
+    scrollbar-color: var(--leaf) transparent;
+    scrollbar-width: thin;
+  }
+
+  .team-roster-scroll::-webkit-scrollbar {
+    height: 4px;
+  }
+
+  .team-roster-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .team-roster-scroll::-webkit-scrollbar-thumb {
+    border-radius: var(--r-pill);
+    background: var(--leaf);
+  }
+
+  a:where(.no-underline-hover) {
+    text-decoration: none;
+  }
+  a:where(.no-underline-hover):hover,
+  a:where(.no-underline-hover):focus {
+    text-decoration: none;
+  }
+
+  .workspace-header {
+    background-color: color-mix(in srgb, var(--canvas) 86%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+  }
+
+  main.page-content {
+    padding-top: 24px;
+  }
+
+  main.page-content > *:first-child {
+    margin-top: 0;
+    position: relative;
+    z-index: 1;
+  }
+}

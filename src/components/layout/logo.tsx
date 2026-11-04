@@ -1,0 +1,54 @@
+"use client";
+
+import Image from "next/image";
+import Link from "next/link";
+
+import { cn } from "@/lib/utils";
+import { useTr } from "@/lib/use-tr";
+
+export function Logo({
+  href = "/",
+  dark = false,
+  compact = false,
+  showTagline = true,
+  className,
+}: {
+  href?: string;
+  dark?: boolean;
+  /** Thu gọn chữ ở breakpoint lg (dùng cùng sidebar thu gọn). */
+  compact?: boolean;
+  showTagline?: boolean;
+  className?: string;
+}) {
+  const tr = useTr();
+  return (
+    <Link
+      href={href}
+      className={cn("inline-flex min-w-0 items-center gap-2 sm:gap-3", compact && "lg:gap-2", className)}
+    >
+      <Image
+        src="/logos/agromind_app_icon_animated_128.gif"
+        alt="Agromind AI logo"
+        width={44}
+        height={44}
+        unoptimized
+        className="h-11 w-11 shrink-0 rounded-lg object-contain"
+      />
+      <span className={cn("flex min-w-0 flex-col", compact && "lg:sr-only")}>
+        <span
+          className={cn(
+            "whitespace-nowrap font-display text-lg font-bold tracking-tight sm:text-xl",
+            dark ? "text-on-forest" : "text-ink",
+          )}
+        >
+          Agromind AI
+        </span>
+        {showTagline ? (
+          <span className={cn("text-[10px] font-semibold uppercase tracking-[0.11em]", dark ? "text-on-forest-muted" : "text-ink-soft")}>
+            {tr("Trợ lý sức khỏe cây trồng", "Plant health assistant")}
+          </span>
+        ) : null}
+      </span>
+    </Link>
+  );
+}

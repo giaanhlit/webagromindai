@@ -1,0 +1,40 @@
+.next
+node_modules
+out
+dist
+.vercel
+.env
+.env.*
+!**/.env.example
+.tmp
+moduleyolola
+*.log
+backend/.venv
+backend/.pip-cache
+backend/db.sqlite3
+backend/**/__pycache__
+**/__pycache__/
+*.pyc
+backend/.env
+.pydeps
+.pydeps-local
+*.pth
+*.pem
+*.key
+*.p12
+*.pfx
+.npmrc
+.pypirc
+.netrc
+credentials*.json
+service-account*.json
+hf_space/best_model.pth
+dashboard-prod.png
+design-review/
+tsconfig.tsbuildinfo
+
+.vercel
+
+# Design hand-off: reference files, not application source.
+Living Leaf Intelligence redesign/
+Living Leaf Intelligence redesign.zip

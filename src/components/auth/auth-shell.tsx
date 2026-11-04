@@ -1,0 +1,83 @@
+"use client";
+
+import Image from "next/image";
+import Link from "next/link";
+import { ArrowLeft, Leaf, ShieldCheck } from "lucide-react";
+
+import { Logo } from "@/components/layout/logo";
+import { useTr } from "@/lib/use-tr";
+
+interface AuthShellProps {
+  eyebrow: string;
+  title: string;
+  description: string;
+  asideTitle: string;
+  asideDescription: string;
+  children: React.ReactNode;
+}
+
+export function AuthShell({ eyebrow, title, description, asideTitle, asideDescription, children }: AuthShellProps) {
+  const tr = useTr();
+  return (
+    <main id="main-content" className="field-contours min-h-[100dvh] bg-canvas px-4 py-4 text-ink sm:px-6 sm:py-6">
+      <div className="mx-auto flex min-h-[calc(100dvh-2rem)] max-w-6xl flex-col overflow-hidden rounded-[var(--r-xl)] border border-line bg-surface shadow-lg sm:min-h-[calc(100dvh-3rem)] lg:grid lg:grid-cols-[0.9fr_1.1fr]">
+        <aside className="relative hidden overflow-hidden bg-forest p-9 text-on-forest lg:flex lg:flex-col lg:justify-between xl:p-12">
+          <Image
+            // The team under the luffa trellis on the Dabaco trial: our own photo, so no
+            // licence to carry, and a real place instead of a rendered leaf.
+            src="/field-trial/trellis-check.webp"
+            alt=""
+            fill
+            priority
+            loading="eager"
+            sizes="45vw"
+            className="object-cover"
+            aria-hidden
+          />
+          {/* `from-forest/68` compiles to nothing (no <alpha-value> on the colour
+              tokens), so this scrim never existed — unnoticed while the picture
+              behind it was a dark render. On a sunlit photo it is the only thing
+              keeping the white copy legible. Values are the brand sheet's
+              mobile-hero scrim, ink-based. */}
+          <div
+            className="absolute inset-0"
+            style={{ backgroundImage: "linear-gradient(180deg, rgba(20,41,26,0.62) 0%, rgba(20,41,26,0.74) 55%, rgba(20,41,26,0.86) 100%)" }}
+            aria-hidden
+          />
+          <div className="relative"><Logo dark showTagline={false} /></div>
+
+          <div className="relative max-w-md">
+            <span className="flex h-12 w-12 items-center justify-center rounded-lg bg-on-forest/10 text-on-forest">
+              <Leaf size={23} aria-hidden />
+            </span>
+            <h2 className="mt-6 font-display text-[38px] font-bold leading-[1.12] tracking-[-0.035em] text-on-forest">{asideTitle}</h2>
+            <p className="mt-5 text-base font-medium leading-8 text-on-forest-muted">{asideDescription}</p>
+          </div>
+
+          <div className="relative flex items-start gap-3 border-t border-on-forest/10 pt-6 text-sm leading-6 text-on-forest-muted">
+            <ShieldCheck size={18} className="mt-0.5 shrink-0 text-on-forest" aria-hidden />
+            <p>{tr("Kết quả AI mang tính tham khảo. Khi cây bệnh lan nhanh hoặc cần dùng thuốc, hãy hỏi thêm chuyên gia nông nghiệp địa phương.", "AI results are for reference only. When a disease spreads quickly or pesticides are needed, consult a local agricultural expert.")}</p>
+          </div>
+        </aside>
+
+        <section className="flex min-h-0 flex-col p-5 sm:p-8 lg:p-10 xl:p-14">
+          <div className="flex items-center justify-between gap-4">
+            <div className="lg:hidden">
+              <Logo showTagline={false} />
+            </div>
+            <Link href="/" className="hidden min-h-11 items-center gap-2 rounded-md px-3 text-sm font-semibold text-ink-soft transition hover:bg-surface-soft hover:text-ink sm:inline-flex">
+              <ArrowLeft size={16} aria-hidden /> {tr("Quay lại trang chủ", "Back to home")}
+            </Link>
+          </div>
+
+          <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center py-10">
+            <p className="text-overline text-leaf-strong">{eyebrow}</p>
+            <h1 className="mt-3 font-display text-[32px] font-bold leading-[1.16] tracking-[-0.035em] text-ink sm:text-[38px]">{title}</h1>
+            <p className="mt-4 text-sm font-medium leading-7 text-ink-soft">{description}</p>
+            <div className="mt-8">{children}</div>
+          </div>
+        </section>
+      </div>
+    </main>
+  );
+}
