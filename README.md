@@ -2,7 +2,7 @@
 
 Agromind AI là ứng dụng chẩn đoán ảnh lá cây và hỗ trợ canh tác. Repo này chứa cả frontend Next.js và backend Django để người clone về có thể chạy local, phát triển tiếp và deploy.
 
-Repo GitHub: https://github.com/manhfaa/webchuandoanla
+Repo GitHub: https://github.com/giaanhlit/webagromindai
 
 ## Tính năng hiện có
 
